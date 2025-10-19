@@ -1,0 +1,28 @@
+{
+  "documents": [],
+  "tables_parsed": [],
+  "tables_source_info": [],
+  "images": [],
+  "summary": {
+    "total_files": 1,
+    "by_category": {
+      "documents": 0,
+      "tables_parsed": 0,
+      "tables_source_info": 0,
+      "images": 0,
+      "document": 1
+    },
+    "processing_time": null
+  },
+  "document": [
+    {
+      "original_name": "import Rea",
+      "file_name": "import Rea.md",
+      "file_path": "/workspace/bar_app/uploaded_files/documents/import Rea.md",
+      "file_type": "txt",
+      "category": "document",
+      "summary": "Processed import Rea for coding",
+      "source_id": "1976031049699823616"
+    }
+  ]
+}
