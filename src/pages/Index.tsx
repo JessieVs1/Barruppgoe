@@ -8,7 +8,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
-import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Printer, Lock } from 'lucide-react';
+import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Download, Lock } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 // ---------- Wekelijkse slotcode (verandert elke donderdag) ----------
@@ -783,14 +783,16 @@ const Index = () => {
     setShowReceiptDialog(true);
   };
 
-  const printReceipt = () => {
+  // De bon wordt gedownload als een op zichzelf staand HTML-bestand (geen
+  // popup, geen printdialoog) — open het bestand in elke browser en het
+  // ziet er meteen uit als een net bonnetje, met dezelfde inhoud als het
+  // voorbeeld hierboven.
+  const downloadReceipt = () => {
     if (!selectedUserForReceipt) return;
-    
-    const printWindow = window.open('', '_blank');
-    if (!printWindow) return;
 
     const total = selectedUserForReceipt.orders.reduce((sum, order) => sum + (order.price * order.quantity), 0);
-    const currentDate = new Date().toLocaleDateString('nl-NL', {
+    const now = new Date();
+    const dateLabel = now.toLocaleDateString('nl-NL', {
       year: 'numeric',
       month: 'long',
       day: 'numeric',
@@ -798,78 +800,61 @@ const Index = () => {
       minute: '2-digit'
     });
 
-    const receiptHTML = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Bon - ${selectedUserForReceipt.name}</title>
-        <style>
-          body { 
-            font-family: 'Courier New', monospace; 
-            max-width: 300px; 
-            margin: 0 auto; 
-            padding: 20px;
-            line-height: 1.4;
-          }
-          .header { text-align: center; border-bottom: 2px solid #000; padding-bottom: 10px; margin-bottom: 15px; }
-          .title { font-size: 18px; font-weight: bold; margin-bottom: 5px; }
-          .subtitle { font-size: 12px; color: #666; }
-          .customer { margin-bottom: 15px; }
-          .items { margin-bottom: 15px; }
-          .item { display: flex; justify-content: space-between; margin-bottom: 5px; }
-          .item-name { flex: 1; }
-          .item-qty { width: 30px; text-align: center; }
-          .item-price { width: 60px; text-align: right; }
-          .separator { border-top: 1px dashed #000; margin: 10px 0; }
-          .total { font-weight: bold; font-size: 16px; text-align: right; }
-          .footer { text-align: center; margin-top: 20px; font-size: 12px; color: #666; }
-          @media print {
-            body { margin: 0; padding: 10px; }
-          }
-        </style>
-      </head>
-      <body>
-        <div class="header">
-          <div class="title">🍺 BAR APP</div>
-          <div class="subtitle">Kassabon</div>
-        </div>
-        
-        <div class="customer">
-          <strong>Klant:</strong> ${selectedUserForReceipt.name}<br>
-          <strong>Code:</strong> ${selectedUserForReceipt.code}<br>
-          <strong>Datum:</strong> ${currentDate}
-        </div>
-        
-        <div class="separator"></div>
-        
-        <div class="items">
-          ${selectedUserForReceipt.orders.map(order => `
-            <div class="item">
-              <span class="item-name">${order.name}</span>
-              <span class="item-qty">${order.quantity}x</span>
-              <span class="item-price">€${(order.price * order.quantity).toFixed(2)}</span>
-            </div>
-          `).join('')}
-        </div>
-        
-        <div class="separator"></div>
-        
-        <div class="total">
-          TOTAAL: €${total.toFixed(2)}
-        </div>
-        
-        <div class="footer">
-          Bedankt voor uw bezoek!<br>
-          Tot ziens! 🍻
-        </div>
-      </body>
-      </html>
-    `;
+    const receiptHTML = `<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8" />
+<title>Bon - ${selectedUserForReceipt.name}</title>
+<style>
+  body { font-family: 'Courier New', monospace; max-width: 320px; margin: 40px auto; padding: 20px; line-height: 1.5; color: #1c1712; background: #faf9f4; }
+  .header { text-align: center; border-bottom: 2px solid #000; padding-bottom: 10px; margin-bottom: 15px; }
+  .title { font-size: 20px; font-weight: bold; margin-bottom: 4px; }
+  .subtitle { font-size: 12px; color: #666; }
+  .customer { margin-bottom: 15px; }
+  .item { display: flex; justify-content: space-between; margin-bottom: 6px; gap: 12px; }
+  .item-name { flex: 1; }
+  .separator { border-top: 1px dashed #000; margin: 12px 0; }
+  .total { font-weight: bold; font-size: 17px; text-align: right; }
+  .footer { text-align: center; margin-top: 24px; font-size: 12px; color: #666; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">🍺 BAR APP</div>
+    <div class="subtitle">Kassabon</div>
+  </div>
+  <div class="customer">
+    <strong>Klant:</strong> ${selectedUserForReceipt.name}<br>
+    <strong>Code:</strong> ${selectedUserForReceipt.code}<br>
+    <strong>Datum bon:</strong> ${dateLabel}
+  </div>
+  <div class="separator"></div>
+  ${selectedUserForReceipt.orders.map(order => `
+  <div class="item">
+    <span class="item-name">${order.name} x${order.quantity}</span>
+    <span>€${(order.price * order.quantity).toFixed(2)}</span>
+  </div>`).join('')}
+  <div class="separator"></div>
+  <div class="total">TOTAAL: €${total.toFixed(2)}</div>
+  <div class="footer">Bedankt voor uw bezoek!<br>Tot ziens! 🍻</div>
+</body>
+</html>`;
 
-    printWindow.document.write(receiptHTML);
-    printWindow.document.close();
-    printWindow.focus();
-    printWindow.print();
+    const safeName = selectedUserForReceipt.name.trim().replace(/[^a-z0-9]+/gi, '-').toLowerCase() || 'klant';
+    const fileDate = now.toISOString().slice(0, 10);
+    const fileName = `bon-${safeName}-${fileDate}.html`;
+
+    const blob = new Blob([receiptHTML], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    toast({ title: "Bon gedownload", description: fileName });
   };
 
   if (currentScreen === 'start') {
@@ -1170,6 +1155,10 @@ const Index = () => {
   }
 
   if (currentScreen === 'admin') {
+    const receiptTotal = selectedUserForReceipt
+      ? selectedUserForReceipt.orders.reduce((sum, order) => sum + (order.price * order.quantity), 0)
+      : 0;
+
     return (
       <div className="min-h-screen bg-gradient-to-br from-background via-muted to-background p-4 animate-fade-in">
         <div className="max-w-6xl mx-auto space-y-6">
@@ -1390,7 +1379,7 @@ const Index = () => {
                   <h3 className="text-lg font-bold">🍺 BAR APP</h3>
                   <p className="text-sm text-muted-foreground">Kassabon</p>
                 </div>
-                
+
                 <div className="space-y-2">
                   <div className="flex justify-between">
                     <span className="font-medium">Klant:</span>
@@ -1401,8 +1390,8 @@ const Index = () => {
                     <span>{selectedUserForReceipt.code}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="font-medium">Datum:</span>
-                    <span>{new Date().toLocaleDateString('nl-NL')}</span>
+                    <span className="font-medium">Datum bon:</span>
+                    <span>{new Date().toLocaleDateString('nl-NL', { year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
                   </div>
                 </div>
 
@@ -1422,7 +1411,7 @@ const Index = () => {
 
                 <div className="flex justify-between items-center font-bold text-lg">
                   <span>TOTAAL:</span>
-                  <span>€{selectedUserForReceipt.orders.reduce((sum, order) => sum + (order.price * order.quantity), 0).toFixed(2)}</span>
+                  <span>€{receiptTotal.toFixed(2)}</span>
                 </div>
 
                 <div className="text-center text-sm text-muted-foreground">
@@ -1434,9 +1423,9 @@ const Index = () => {
               <Button variant="outline" onClick={() => setShowReceiptDialog(false)}>
                 Sluiten
               </Button>
-              <Button onClick={printReceipt} className="glow-effect">
-                <Printer className="h-4 w-4 mr-2" />
-                Printen
+              <Button onClick={downloadReceipt} className="glow-effect" disabled={!selectedUserForReceipt}>
+                <Download className="h-4 w-4 mr-2" />
+                Downloaden
               </Button>
             </DialogFooter>
           </DialogContent>
