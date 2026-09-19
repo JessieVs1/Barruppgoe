@@ -506,10 +506,35 @@ const Index = () => {
 
     setLoading(true);
     try {
+      const product = products.find(p => p.id === id);
+      const diff = product ? product.stock - stock : 0;
+
       await supabase.from('products_2025_10_08_21_03').update({ stock }).eq('id', id);
+
+      // If the stock was manually lowered, log the difference automatically
+      // so it shows up under "Verdwenen goederen" instead of silently disappearing.
+      if (product && diff > 0) {
+        await supabase.from('missing_items_2025_10_08_21_03').insert({
+          product_name: product.name,
+          quantity: diff,
+          reason: `Voorraad handmatig verlaagd (verschil van ${diff} automatisch geregistreerd)`,
+          reported_by: 'Voorraadbeheer (automatisch)'
+        });
+        loadMissingItems();
+      }
+
       const { data } = await supabase.from('products_2025_10_08_21_03').select('*');
       setProducts(data || []);
-      toast({ title: "Succes", description: "Voorraad bijgewerkt" });
+
+      if (product && diff > 0) {
+        toast({
+          title: "Succes",
+          description: `Voorraad bijgewerkt — verschil van ${diff} geregistreerd bij Verdwenen goederen`,
+          duration: 5000
+        });
+      } else {
+        toast({ title: "Succes", description: "Voorraad bijgewerkt" });
+      }
     } catch (error) {
       toast({
         title: "Fout",
