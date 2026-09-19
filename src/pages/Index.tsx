@@ -7,8 +7,53 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
-import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Printer } from 'lucide-react';
+import { Switch } from '@/components/ui/switch';
+import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Printer, Lock } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
+
+// ---------- Wekelijkse slotcode (verandert elke donderdag) ----------
+// De code is volledig voorspelbaar uit de datum (geen database nodig):
+// iedereen die tussen donderdag en de volgende woensdag een bestelling
+// plaatst, krijgt dezelfde code te zien; zodra het weer donderdag wordt,
+// verandert de code automatisch.
+
+/** Middernacht van de meest recente donderdag (vandaag telt mee als het al donderdag is). */
+function getMostRecentThursday(date: Date = new Date()): Date {
+  const d = new Date(date);
+  const day = d.getDay(); // 0 = zondag ... 4 = donderdag ... 6 = zaterdag
+  const diff = (day - 4 + 7) % 7;
+  d.setDate(d.getDate() - diff);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+/** Kleine, deterministische pseudo-random generator op basis van een tekst-seed. */
+function seededRandom(seedStr: string): () => number {
+  let hash = 0;
+  for (let i = 0; i < seedStr.length; i++) {
+    hash = (hash << 5) - hash + seedStr.charCodeAt(i);
+    hash |= 0;
+  }
+  let seed = hash >>> 0;
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** De 4-cijferige code voor de huidige week (donderdag t/m woensdag). */
+function getWeeklyLockCode(date: Date = new Date()): string {
+  const thursday = getMostRecentThursday(date);
+  const seed = thursday.toISOString().slice(0, 10); // bv. "2026-09-17"
+  const rand = seededRandom(seed);
+  let code = '';
+  for (let i = 0; i < 4; i++) {
+    code += Math.floor(rand() * 10);
+  }
+  return code;
+}
 
 interface User {
   id: number;
@@ -71,6 +116,9 @@ const Index = () => {
   const [monthlyRevenue, setMonthlyRevenue] = useState<MonthlyRevenue[]>([]);
   const [adminSection, setAdminSection] = useState<string>('');
   const [showConfirmOrder, setShowConfirmOrder] = useState(false);
+  const [showLockCodeDialog, setShowLockCodeDialog] = useState(false);
+  const [maintenanceMode, setMaintenanceMode] = useState(false);
+  const [maintenanceMessage, setMaintenanceMessage] = useState('We voeren momenteel onderhoud uit aan de app. Bestellen kan gewoon doorgaan!');
   const [showMissingItemDialog, setShowMissingItemDialog] = useState(false);
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -96,6 +144,15 @@ const Index = () => {
     window.addEventListener('scroll', handleScroll);
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
+
+  // Onderhoudsmodus opnieuw ophalen zodra het startscherm te zien is,
+  // zodat een wijziging door iemand anders (op een ander apparaat) ook
+  // hier zichtbaar wordt.
+  useEffect(() => {
+    if (currentScreen === 'start') {
+      loadSettings();
+    }
+  }, [currentScreen]);
 
   // Filter and search products
   useEffect(() => {
@@ -291,8 +348,7 @@ const Index = () => {
 
       setCart([]);
       setShowConfirmOrder(false);
-      setCurrentScreen('start');
-      setCurrentUser(null);
+      setShowLockCodeDialog(true);
     } catch (error) {
       toast({
         title: "Fout",
@@ -302,6 +358,12 @@ const Index = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  const closeLockCodeDialog = () => {
+    setShowLockCodeDialog(false);
+    setCurrentScreen('start');
+    setCurrentUser(null);
   };
 
   const loadUsers = async () => {
@@ -377,6 +439,51 @@ const Index = () => {
       toast({
         title: "Fout",
         description: "Kon maandelijkse omzet niet laden",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ---------- Onderhoudsmodus ----------
+  // Staat in een eigen instellingen-tabel zodat elk apparaat (niet alleen
+  // dit scherm) dezelfde status ziet, ook nadat iemand anders 'm heeft
+  // aan- of uitgezet.
+  const loadSettings = async () => {
+    try {
+      const { data } = await supabase
+        .from('app_settings_2025_10_08_21_03')
+        .select('*')
+        .eq('id', 1)
+        .single();
+      if (data) {
+        setMaintenanceMode(!!data.maintenance_mode);
+        if (data.maintenance_message) setMaintenanceMessage(data.maintenance_message);
+      }
+    } catch (error) {
+      // Instellingen-tabel bestaat nog niet of is niet bereikbaar:
+      // gewoon stil negeren, onderhoudsmodus blijft dan uit.
+    }
+  };
+
+  const toggleMaintenanceMode = async () => {
+    const newValue = !maintenanceMode;
+    setLoading(true);
+    try {
+      await supabase
+        .from('app_settings_2025_10_08_21_03')
+        .update({ maintenance_mode: newValue, updated_at: new Date().toISOString() })
+        .eq('id', 1);
+      setMaintenanceMode(newValue);
+      toast({
+        title: "Succes",
+        description: newValue ? "Onderhoudsmodus staat nu aan" : "Onderhoudsmodus staat nu uit"
+      });
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon onderhoudsmodus niet wijzigen",
         variant: "destructive"
       });
     } finally {
@@ -636,18 +743,35 @@ const Index = () => {
 
   const getMissingItemsLoss = () => {
     const lossData: { [key: string]: number } = {};
+    // Persistent per-month breakdown, computed from each item's own date —
+    // so it naturally keeps every past month, while "currentMonthLoss"
+    // always starts back at €0 as soon as a new month begins.
+    const monthlyLoss: { [key: string]: { year: number; month: number; loss: number } } = {};
     let totalLoss = 0;
-    
+    let currentMonthLoss = 0;
+
+    const now = new Date();
+    const currentKey = `${now.getFullYear()}-${now.getMonth() + 1}`;
+
     missingItems.forEach(item => {
       const product = products.find(p => p.name === item.product_name);
       if (product) {
         const loss = product.price * item.quantity;
         lossData[item.product_name] = (lossData[item.product_name] || 0) + loss;
         totalLoss += loss;
+
+        const d = new Date(item.created_at);
+        const key = `${d.getFullYear()}-${d.getMonth() + 1}`;
+        if (!monthlyLoss[key]) {
+          monthlyLoss[key] = { year: d.getFullYear(), month: d.getMonth() + 1, loss: 0 };
+        }
+        monthlyLoss[key].loss += loss;
+
+        if (key === currentKey) currentMonthLoss += loss;
       }
     });
-    
-    return { lossData, totalLoss };
+
+    return { lossData, totalLoss, currentMonthLoss, monthlyLoss };
   };
 
   const generateReceipt = (userCode: string, userName: string, userOrders: Order[]) => {
@@ -751,33 +875,44 @@ const Index = () => {
   if (currentScreen === 'start') {
     return (
       <div className="min-h-screen bg-gradient-to-br from-background via-muted to-background flex items-center justify-center p-4 animate-fade-in">
-        <Card className="w-full max-w-md bar-card animate-bounce-in">
-          <CardHeader className="text-center">
-            <CardTitle className="text-3xl font-bold gradient-text mb-2">🍺 Bar App</CardTitle>
-            <p className="text-muted-foreground">Welkom bij onze bar</p>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Button 
-              onClick={promptUserCode} 
-              className="w-full bar-button glow-effect" 
-              size="lg"
-              disabled={loading}
-            >
-              <ShoppingCart className="mr-2 h-5 w-5" />
-              {loading ? "Laden..." : "Bestellen"}
-            </Button>
-            <Button 
-              onClick={promptAdminCode} 
-              variant="outline" 
-              className="w-full bar-button" 
-              size="lg"
-              disabled={loading}
-            >
-              <User className="mr-2 h-5 w-5" />
-              Beheer
-            </Button>
-          </CardContent>
-        </Card>
+        <div className="w-full max-w-md space-y-4">
+          {maintenanceMode && (
+            <div className="bg-primary/15 border border-primary/40 text-foreground rounded-xl p-4 flex items-start gap-3 animate-slide-up">
+              <AlertTriangle className="h-5 w-5 text-primary flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">Onderhoud</p>
+                <p className="text-sm text-muted-foreground">{maintenanceMessage}</p>
+              </div>
+            </div>
+          )}
+          <Card className="w-full bar-card animate-bounce-in">
+            <CardHeader className="text-center">
+              <CardTitle className="text-3xl font-bold gradient-text mb-2">🍺 Bar App</CardTitle>
+              <p className="text-muted-foreground">Welkom bij onze bar</p>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <Button
+                onClick={promptUserCode}
+                className="w-full bar-button glow-effect"
+                size="lg"
+                disabled={loading}
+              >
+                <ShoppingCart className="mr-2 h-5 w-5" />
+                {loading ? "Laden..." : "Bestellen"}
+              </Button>
+              <Button
+                onClick={promptAdminCode}
+                variant="outline"
+                className="w-full bar-button"
+                size="lg"
+                disabled={loading}
+              >
+                <User className="mr-2 h-5 w-5" />
+                Beheer
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
       </div>
     );
   }
@@ -995,6 +1130,31 @@ const Index = () => {
           </DialogContent>
         </Dialog>
 
+        {/* Weekly Lock Code Dialog */}
+        <Dialog open={showLockCodeDialog} onOpenChange={(open) => { if (!open) closeLockCodeDialog(); }}>
+          <DialogContent className="bar-card">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Lock className="h-5 w-5 text-primary" />
+                Code voor het slot
+              </DialogTitle>
+              <DialogDescription>
+                Deze code geldt de hele week en wisselt elke donderdag.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="py-6 text-center">
+              <p className="text-5xl font-bold tracking-[0.3em] gradient-text">
+                {getWeeklyLockCode()}
+              </p>
+            </div>
+            <DialogFooter>
+              <Button onClick={closeLockCodeDialog} className="w-full glow-effect">
+                Sluiten
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         {/* Back to Top Button */}
         {showBackToTop && (
           <Button
@@ -1018,6 +1178,44 @@ const Index = () => {
             <Button onClick={() => setCurrentScreen('start')} variant="outline" className="bar-button">
               Terug naar start
             </Button>
+          </div>
+
+          {/* Slotcode + Onderhoudsmodus */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-slide-up">
+            <Card className="bar-card">
+              <CardContent className="p-4 flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-sm font-medium text-muted-foreground flex items-center gap-2">
+                    <Lock className="h-4 w-4" />
+                    Code voor het slot (deze week)
+                  </p>
+                  <p className="text-3xl font-bold tracking-[0.3em] gradient-text mt-1">
+                    {getWeeklyLockCode()}
+                  </p>
+                </div>
+                <Badge variant="outline" className="text-xs whitespace-nowrap">Wisselt elke donderdag</Badge>
+              </CardContent>
+            </Card>
+
+            <Card className="bar-card">
+              <CardContent className="p-4 flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-sm font-medium flex items-center gap-2">
+                    <AlertTriangle className="h-4 w-4" />
+                    Onderhoudsmodus
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {maintenanceMode ? "Aan — zichtbaar op het inlogscherm" : "Uit — inlogscherm toont geen melding"}
+                  </p>
+                  <p className="text-xs text-muted-foreground">Bestellen blijft altijd mogelijk</p>
+                </div>
+                <Switch
+                  checked={maintenanceMode}
+                  onCheckedChange={toggleMaintenanceMode}
+                  disabled={loading}
+                />
+              </CardContent>
+            </Card>
           </div>
 
           {/* Mobile Menu Toggle */}
@@ -1701,10 +1899,21 @@ const OrderHistory = ({ orders, users, onClearOrders, onGenerateReceipt, loading
 const RevenueSection = ({ monthlyRevenue, productRevenue, missingItemsLoss }: {
   monthlyRevenue: { [key: string]: number };
   productRevenue: { [key: string]: number };
-  missingItemsLoss: { lossData: { [key: string]: number }; totalLoss: number };
+  missingItemsLoss: {
+    lossData: { [key: string]: number };
+    totalLoss: number;
+    currentMonthLoss: number;
+    monthlyLoss: { [key: string]: { year: number; month: number; loss: number } };
+  };
 }) => {
   const totalRevenue = Object.values(productRevenue).reduce((sum, revenue) => sum + revenue, 0);
   const netRevenue = totalRevenue - missingItemsLoss.totalLoss;
+
+  const monthlyLossEntries = Object.values(missingItemsLoss.monthlyLoss).sort((a, b) =>
+    b.year - a.year || b.month - a.month
+  );
+  const monthLabel = (year: number, month: number) =>
+    new Date(year, month - 1).toLocaleDateString('nl-NL', { year: 'numeric', month: 'long' });
 
   return (
     <div className="space-y-6 animate-slide-up">
@@ -1716,8 +1925,9 @@ const RevenueSection = ({ monthlyRevenue, productRevenue, missingItemsLoss }: {
             <p className="text-2xl font-bold text-primary">€{totalRevenue.toFixed(2)}</p>
           </div>
           <div className="bg-card/90 backdrop-blur-sm border border-border/70 rounded-xl p-4">
-            <h3 className="text-sm font-medium text-muted-foreground mb-1">Verlies (Verdwenen)</h3>
-            <p className="text-2xl font-bold text-destructive">-€{missingItemsLoss.totalLoss.toFixed(2)}</p>
+            <h3 className="text-sm font-medium text-muted-foreground mb-1">Verlies deze maand</h3>
+            <p className="text-2xl font-bold text-destructive">-€{missingItemsLoss.currentMonthLoss.toFixed(2)}</p>
+            <p className="text-xs text-muted-foreground mt-1">Begint elke maand weer op €0,00</p>
           </div>
           <div className="bg-card/90 backdrop-blur-sm border border-border/70 rounded-xl p-4">
             <h3 className="text-sm font-medium text-muted-foreground mb-1">Netto Omzet</h3>
@@ -1752,6 +1962,29 @@ const RevenueSection = ({ monthlyRevenue, productRevenue, missingItemsLoss }: {
 
         <Card className="bar-card">
           <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <AlertTriangle className="h-5 w-5 text-destructive" />
+              📅 Verlies per maand
+            </CardTitle>
+            <p className="text-sm text-muted-foreground">De huidige maand begint steeds weer op €0,00; oudere maanden blijven zichtbaar</p>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-3 max-h-80 overflow-y-auto">
+              {monthlyLossEntries.map(entry => (
+                <div key={`${entry.year}-${entry.month}`} className="flex justify-between items-center p-3 border rounded-lg bg-destructive/5">
+                  <span className="font-medium">{monthLabel(entry.year, entry.month)}</span>
+                  <Badge variant="destructive" className="text-lg">-€{entry.loss.toFixed(2)}</Badge>
+                </div>
+              ))}
+              {monthlyLossEntries.length === 0 && (
+                <p className="text-center text-muted-foreground py-4">Geen verlies geregistreerd</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bar-card">
+          <CardHeader>
             <CardTitle>Omzet per product</CardTitle>
           </CardHeader>
           <CardContent>
@@ -1775,7 +2008,7 @@ const RevenueSection = ({ monthlyRevenue, productRevenue, missingItemsLoss }: {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <AlertTriangle className="h-5 w-5 text-destructive" />
-              Verlies per product
+              Verlies per product (totaal)
             </CardTitle>
           </CardHeader>
           <CardContent>
