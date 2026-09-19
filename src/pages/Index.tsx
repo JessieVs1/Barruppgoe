@@ -311,35 +311,45 @@ const Index = () => {
   const placeOrder = async () => {
     if (!currentUser) return;
 
+    // Eerst alle regels van het winkelwagentje controleren, vóórdat er
+    // iets wordt weggeschreven. Zo voorkomen we dat een deel van de
+    // bestelling al is verwerkt wanneer een later item niet op voorraad
+    // blijkt te zijn.
+    for (const item of cart) {
+      const product = products.find(p => p.id === item.id);
+      if (!product || product.stock < item.quantity) {
+        toast({
+          title: "Fout",
+          description: `Onvoldoende voorraad voor ${item.name}`,
+          variant: "destructive"
+        });
+        return;
+      }
+    }
+
     setLoading(true);
     try {
-      for (const item of cart) {
-        const product = products.find(p => p.id === item.id);
-        if (!product || product.stock < item.quantity) {
-          toast({
-            title: "Fout",
-            description: `Onvoldoende voorraad voor ${item.name}`,
-            variant: "destructive"
-          });
-          return;
-        }
-
-        // Update stock
-        await supabase
-          .from('products_2025_10_08_21_03')
-          .update({ stock: product.stock - item.quantity })
-          .eq('id', item.id);
-
-        // Insert order
-        await supabase
-          .from('orders_2025_10_08_21_03')
-          .insert({
-            name: item.name,
-            quantity: item.quantity,
-            price: item.price,
-            user_code: currentUser.code
-          });
-      }
+      // Alle voorraad- en bestel-writes gelijktijdig versturen in plaats
+      // van na elkaar te wachten op elk item.
+      await Promise.all(
+        cart.flatMap(item => {
+          const product = products.find(p => p.id === item.id)!;
+          return [
+            supabase
+              .from('products_2025_10_08_21_03')
+              .update({ stock: product.stock - item.quantity })
+              .eq('id', item.id),
+            supabase
+              .from('orders_2025_10_08_21_03')
+              .insert({
+                name: item.name,
+                quantity: item.quantity,
+                price: item.price,
+                user_code: currentUser.code
+              }),
+          ];
+        })
+      );
 
       toast({
         title: "Succes! 🎉",
@@ -446,6 +456,41 @@ const Index = () => {
     }
   };
 
+  // Laadt bestellingen, verdwenen goederen en maandomzet gelijktijdig,
+  // met één gedeelde loading-status. Zo voorkomen we dat drie losse
+  // aanroepen elkaars "loading" waarde overschrijven (race condition).
+  const loadRevenueData = async () => {
+    setLoading(true);
+    try {
+      await Promise.all([
+        (async () => {
+          const { data } = await supabase.from('orders_2025_10_08_21_03').select('*');
+          setOrders(data || []);
+        })(),
+        (async () => {
+          const { data } = await supabase.from('missing_items_2025_10_08_21_03').select('*');
+          setMissingItems(data || []);
+        })(),
+        (async () => {
+          const { data } = await supabase
+            .from('monthly_revenue_2025_10_09_18_50')
+            .select('*')
+            .order('year', { ascending: false })
+            .order('month', { ascending: false });
+          setMonthlyRevenue(data || []);
+        })(),
+      ]);
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon omzetgegevens niet laden",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
   // ---------- Onderhoudsmodus ----------
   // Staat in een eigen instellingen-tabel zodat elk apparaat (niet alleen
   // dit scherm) dezelfde status ziet, ook nadat iemand anders 'm heeft
@@ -504,7 +549,7 @@ const Index = () => {
     setLoading(true);
     try {
       await supabase.from('users_2025_10_08_21_03').insert({ name, code });
-      loadUsers();
+      await loadUsers();
       toast({ title: "Succes", description: "Gebruiker toegevoegd" });
     } catch (error) {
       toast({
@@ -523,7 +568,7 @@ const Index = () => {
     setLoading(true);
     try {
       await supabase.from('users_2025_10_08_21_03').delete().eq('id', id);
-      loadUsers();
+      await loadUsers();
       toast({ title: "Succes", description: "Gebruiker verwijderd" });
     } catch (error) {
       toast({
@@ -627,7 +672,7 @@ const Index = () => {
           reason: `Voorraad handmatig verlaagd (verschil van ${diff} automatisch geregistreerd)`,
           reported_by: 'Voorraadbeheer (automatisch)'
         });
-        loadMissingItems();
+        await loadMissingItems();
       }
 
       const { data } = await supabase.from('products_2025_10_08_21_03').select('*');
@@ -681,7 +726,7 @@ const Index = () => {
 
       setMissingItemForm({ product_name: '', quantity: 1, reason: '', reported_by: 'Admin' });
       setShowMissingItemDialog(false);
-      loadMissingItems();
+      await loadMissingItems();
       toast({ title: "Succes", description: "Verdwenen goederen geregistreerd" });
     } catch (error) {
       toast({
@@ -700,8 +745,8 @@ const Index = () => {
     setLoading(true);
     try {
       await supabase.from('orders_2025_10_08_21_03').delete().neq('id', 0);
-      loadOrders();
-      toast({ 
+      await loadOrders();
+      toast({
         title: "Succes", 
         description: "Alle bestellingen verwijderd. Maandelijkse omzet blijft behouden.",
         duration: 5000
@@ -1246,7 +1291,7 @@ const Index = () => {
               Bestelgeschiedenis
             </Button>
             <Button 
-              onClick={() => { setAdminSection('revenue'); loadOrders(); loadMissingItems(); loadMonthlyRevenue(); setShowMobileMenu(false); }} 
+              onClick={() => { setAdminSection('revenue'); loadRevenueData(); setShowMobileMenu(false); }}
               variant={adminSection === 'revenue' ? 'default' : 'outline'}
               className="h-20 bar-button"
             >
@@ -2088,7 +2133,15 @@ const MissingItemsSection = ({ missingItems, onReportMissing, loading }: {
                 <p className="text-sm text-muted-foreground mb-2 bg-muted/30 p-2 rounded">{item.reason}</p>
                 <div className="flex justify-between text-xs text-muted-foreground">
                   <span>Door: <span className="font-medium">{item.reported_by}</span></span>
-                  <span>{new Date(item.created_at).toLocaleDateString('nl-NL')}</span>
+                  <span>{new Date(item.created_at).toLocaleDateString('nl-NL', {
+                    year: 'numeric',
+                    month: 'short',
+                    day: 'numeric'
+                  })} om {new Date(item.created_at).toLocaleTimeString('nl-NL', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                  })}</span>
                 </div>
               </div>
             ))}
