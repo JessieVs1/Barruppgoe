@@ -59,6 +59,7 @@ interface User {
   id: number;
   name: string;
   code: string;
+  status?: 'pending' | 'approved';
 }
 
 interface Product {
@@ -120,6 +121,8 @@ const Index = () => {
   const [maintenanceMode, setMaintenanceMode] = useState(false);
   const [maintenanceMessage, setMaintenanceMessage] = useState('We voeren momenteel onderhoud uit aan de app. Bestellen kan gewoon doorgaan!');
   const [showMissingItemDialog, setShowMissingItemDialog] = useState(false);
+  const [showRegisterDialog, setShowRegisterDialog] = useState(false);
+  const [registerForm, setRegisterForm] = useState({ name: '', code: '' });
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [userSearchQuery, setUserSearchQuery] = useState('');
@@ -202,7 +205,13 @@ const Index = () => {
           .eq('code', code)
           .single();
         
-        if (data) {
+        if (data && data.status === 'pending') {
+          toast({
+            title: "Nog niet goedgekeurd",
+            description: "Je registratie wacht nog op goedkeuring door de beheerder",
+            variant: "destructive"
+          });
+        } else if (data) {
           setCurrentUser(data);
           loadOrderScreen();
         } else {
@@ -536,6 +545,95 @@ const Index = () => {
     }
   };
 
+  // ---------- Zelf registreren ----------
+  // Iedereen kan zelf een naam + code aanmaken, maar kan pas bestellen
+  // nadat een beheerder de registratie heeft goedgekeurd.
+  const registerUser = async () => {
+    const name = registerForm.name.trim();
+    const code = registerForm.code.trim();
+
+    if (!name || !code) {
+      toast({
+        title: "Fout",
+        description: "Vul je naam en een code in",
+        variant: "destructive"
+      });
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { error } = await supabase
+        .from('users_2025_10_08_21_03')
+        .insert({ name, code, status: 'pending' });
+
+      if (error) {
+        if (error.code === '23505') {
+          toast({
+            title: "Fout",
+            description: "Deze code is al in gebruik, kies een andere",
+            variant: "destructive"
+          });
+        } else {
+          throw error;
+        }
+        return;
+      }
+
+      setRegisterForm({ name: '', code: '' });
+      setShowRegisterDialog(false);
+      toast({
+        title: "Registratie verstuurd",
+        description: "Je kunt bestellen zodra een beheerder je hebt goedgekeurd",
+        duration: 6000
+      });
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon registratie niet versturen",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const approveUser = async (id: number) => {
+    setLoading(true);
+    try {
+      await supabase.from('users_2025_10_08_21_03').update({ status: 'approved' }).eq('id', id);
+      await loadUsers();
+      toast({ title: "Succes", description: "Gebruiker goedgekeurd" });
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon gebruiker niet goedkeuren",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const rejectUser = async (id: number) => {
+    if (!confirm("Weet je zeker dat je deze registratie wilt afwijzen? De aanvraag wordt verwijderd.")) return;
+
+    setLoading(true);
+    try {
+      await supabase.from('users_2025_10_08_21_03').delete().eq('id', id);
+      await loadUsers();
+      toast({ title: "Succes", description: "Registratie afgewezen" });
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon registratie niet afwijzen",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const addUser = async (name: string, code: string) => {
     if (!name || !code) {
       toast({
@@ -548,7 +646,7 @@ const Index = () => {
 
     setLoading(true);
     try {
-      await supabase.from('users_2025_10_08_21_03').insert({ name, code });
+      await supabase.from('users_2025_10_08_21_03').insert({ name, code, status: 'approved' });
       await loadUsers();
       toast({ title: "Succes", description: "Gebruiker toegevoegd" });
     } catch (error) {
@@ -931,6 +1029,16 @@ const Index = () => {
                 {loading ? "Laden..." : "Bestellen"}
               </Button>
               <Button
+                onClick={() => setShowRegisterDialog(true)}
+                variant="secondary"
+                className="w-full bar-button"
+                size="lg"
+                disabled={loading}
+              >
+                <User className="mr-2 h-5 w-5" />
+                Nieuw account aanvragen
+              </Button>
+              <Button
                 onClick={promptAdminCode}
                 variant="outline"
                 className="w-full bar-button"
@@ -943,6 +1051,38 @@ const Index = () => {
             </CardContent>
           </Card>
         </div>
+
+        {/* Registratie Dialog */}
+        <Dialog open={showRegisterDialog} onOpenChange={setShowRegisterDialog}>
+          <DialogContent className="bar-card">
+            <DialogHeader>
+              <DialogTitle>Nieuw account aanvragen</DialogTitle>
+              <DialogDescription>
+                Vul je naam en een zelfgekozen code in. Een beheerder moet je registratie nog goedkeuren voordat je kunt bestellen.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <Input
+                placeholder="Naam"
+                value={registerForm.name}
+                onChange={(e) => setRegisterForm(prev => ({ ...prev, name: e.target.value }))}
+              />
+              <Input
+                placeholder="Code (zelf kiezen)"
+                value={registerForm.code}
+                onChange={(e) => setRegisterForm(prev => ({ ...prev, code: e.target.value }))}
+              />
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowRegisterDialog(false)} disabled={loading}>
+                Annuleren
+              </Button>
+              <Button onClick={registerUser} disabled={loading || !registerForm.name || !registerForm.code} className="glow-effect">
+                {loading ? "Versturen..." : "Aanvragen"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     );
   }
@@ -1266,13 +1406,18 @@ const Index = () => {
 
           {/* Admin Menu */}
           <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 animate-slide-up ${showMobileMenu ? 'block' : 'hidden md:grid'}`}>
-            <Button 
-              onClick={() => { setAdminSection('users'); loadUsers(); setShowMobileMenu(false); }} 
+            <Button
+              onClick={() => { setAdminSection('users'); loadUsers(); setShowMobileMenu(false); }}
               variant={adminSection === 'users' ? 'default' : 'outline'}
-              className="h-20 bar-button"
+              className="h-20 bar-button relative"
             >
               <User className="mr-2 h-5 w-5" />
               Gebruikersbeheer
+              {users.filter(u => u.status === 'pending').length > 0 && (
+                <Badge variant="destructive" className="absolute -top-2 -right-2">
+                  {users.filter(u => u.status === 'pending').length}
+                </Badge>
+              )}
             </Button>
             <Button 
               onClick={() => { setAdminSection('products'); loadProducts(); setShowMobileMenu(false); }} 
@@ -1310,10 +1455,13 @@ const Index = () => {
 
           {/* Admin Sections */}
           {adminSection === 'users' && (
-            <UserManagement 
-              users={filteredUsers} 
-              onAddUser={addUser} 
+            <UserManagement
+              users={filteredUsers.filter(u => u.status !== 'pending')}
+              pendingUsers={users.filter(u => u.status === 'pending')}
+              onAddUser={addUser}
               onDeleteUser={deleteUser}
+              onApproveUser={approveUser}
+              onRejectUser={rejectUser}
               searchQuery={userSearchQuery}
               onSearchChange={setUserSearchQuery}
               loading={loading}
@@ -1494,10 +1642,13 @@ const Index = () => {
 };
 
 // Component for User Management
-const UserManagement = ({ users, onAddUser, onDeleteUser, searchQuery, onSearchChange, loading }: {
+const UserManagement = ({ users, pendingUsers, onAddUser, onDeleteUser, onApproveUser, onRejectUser, searchQuery, onSearchChange, loading }: {
   users: User[];
+  pendingUsers: User[];
   onAddUser: (name: string, code: string) => void;
   onDeleteUser: (id: number) => void;
+  onApproveUser: (id: number) => void;
+  onRejectUser: (id: number) => void;
   searchQuery: string;
   onSearchChange: (query: string) => void;
   loading: boolean;
@@ -1512,7 +1663,47 @@ const UserManagement = ({ users, onAddUser, onDeleteUser, searchQuery, onSearchC
   };
 
   return (
-    <Card className="bar-card animate-slide-up">
+    <div className="space-y-4">
+      {pendingUsers.length > 0 && (
+        <Card className="bar-card animate-slide-up border-destructive/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <AlertTriangle className="h-5 w-5 text-destructive" />
+              Wachtend op goedkeuring ({pendingUsers.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {pendingUsers.map(user => (
+              <div key={user.id} className="flex justify-between items-center p-3 border rounded-lg bg-destructive/5">
+                <div>
+                  <span className="font-medium">{user.name}</span>
+                  <Badge variant="secondary" className="ml-2">{user.code}</Badge>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => onApproveUser(user.id)}
+                    disabled={loading}
+                    className="bar-button glow-effect"
+                  >
+                    Goedkeuren
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => onRejectUser(user.id)}
+                    disabled={loading}
+                    className="bar-button"
+                  >
+                    Afwijzen
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+      <Card className="bar-card animate-slide-up">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
           <User className="h-5 w-5" />
@@ -1580,7 +1771,8 @@ const UserManagement = ({ users, onAddUser, onDeleteUser, searchQuery, onSearchC
           </Button>
         </div>
       </CardContent>
-    </Card>
+      </Card>
+    </div>
   );
 };
 
