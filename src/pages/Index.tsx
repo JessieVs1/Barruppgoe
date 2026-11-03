@@ -8,7 +8,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
-import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Download, Lock } from 'lucide-react';
+import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Download, Lock, Clock, KeyRound, Wallet } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 // ---------- Wekelijkse slotcode (verandert elke donderdag) ----------
@@ -84,7 +84,49 @@ interface Order {
   price: number;
   user_code: string;
   created_at: string;
+  settlement_id?: number | null;
 }
+
+interface AdminCode {
+  id: number;
+  name: string;
+  code: string;
+  permissions?: string[];
+  created_at: string;
+}
+
+// Onderdelen van Beheer waarvoor de hoofdbeheerder per beheerder kan
+// instellen of die erbij mag.
+const ADMIN_PERMISSIONS = [
+  { key: 'users', label: 'Gebruikersbeheer' },
+  { key: 'products', label: 'Voorraadbeheer' },
+  { key: 'orders', label: 'Bestelgeschiedenis' },
+  { key: 'revenue', label: 'Omzet' },
+  { key: 'missing', label: 'Verdwenen goederen' },
+  { key: 'settlements', label: 'Tikkies' },
+  { key: 'settings', label: 'Onderhoudsmodus & slotcode-schakelaar' },
+] as const;
+const ALL_PERMISSIONS: string[] = ADMIN_PERMISSIONS.map(p => p.key);
+
+interface Settlement {
+  id: number;
+  created_at: string;
+  due_at: string;
+}
+
+interface SettlementItem {
+  id: number;
+  settlement_id: number;
+  user_code: string;
+  user_name: string;
+  amount: number;
+  paid: boolean;
+  paid_at: string | null;
+}
+
+// Hoofdbeheerder: deze code blijft altijd werken en kan als enige
+// extra beheercodes aanmaken of verwijderen.
+const MAIN_ADMIN_CODE = 'BHV123';
 
 interface MissingItem {
   id: number;
@@ -120,6 +162,16 @@ const Index = () => {
   const [showLockCodeDialog, setShowLockCodeDialog] = useState(false);
   const [maintenanceMode, setMaintenanceMode] = useState(false);
   const [maintenanceMessage, setMaintenanceMessage] = useState('We voeren momenteel onderhoud uit aan de app. Bestellen kan gewoon doorgaan!');
+  const [lockCodeEnabled, setLockCodeEnabled] = useState(true);
+  const [isMainAdmin, setIsMainAdmin] = useState(false);
+  const [adminName, setAdminName] = useState('Admin');
+  const [adminPermissions, setAdminPermissions] = useState<string[]>(ALL_PERMISSIONS);
+  const [showThankYou, setShowThankYou] = useState(false);
+  const [thankYouShowsCode, setThankYouShowsCode] = useState(true);
+  const [adminCodes, setAdminCodes] = useState<AdminCode[]>([]);
+  const [settlements, setSettlements] = useState<Settlement[]>([]);
+  const [settlementItems, setSettlementItems] = useState<SettlementItem[]>([]);
+  const [tikkieBlock, setTikkieBlock] = useState<{ amount: number } | null>(null);
   const [showMissingItemDialog, setShowMissingItemDialog] = useState(false);
   const [showRegisterDialog, setShowRegisterDialog] = useState(false);
   const [registerForm, setRegisterForm] = useState({ name: '', code: '' });
@@ -154,6 +206,10 @@ const Index = () => {
   useEffect(() => {
     if (currentScreen === 'start') {
       loadSettings();
+      // Bij terugkeer naar het startscherm is niemand meer als beheerder ingelogd.
+      setIsMainAdmin(false);
+      setAdminName('Admin');
+      setAdminPermissions(ALL_PERMISSIONS);
     }
   }, [currentScreen]);
 
@@ -194,6 +250,9 @@ const Index = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  // Mag de ingelogde beheerder dit onderdeel van Beheer gebruiken?
+  const can = (permission: string) => isMainAdmin || adminPermissions.includes(permission);
+
   const promptUserCode = async () => {
     const code = prompt("Voer je gebruikerscode in:");
     if (code) {
@@ -212,6 +271,19 @@ const Index = () => {
             variant: "destructive"
           });
         } else if (data) {
+          // Openstaande tikkie niet op tijd betaald? Dan geen toegang tot bestellen.
+          const tikkie = await getTikkieStatus(data.code);
+          if (tikkie.overdueAmount > 0) {
+            setTikkieBlock({ amount: tikkie.overdueAmount });
+            return;
+          }
+          if (tikkie.pendingAmount > 0 && tikkie.nextDue) {
+            toast({
+              title: "Tikkie openstaand",
+              description: `Betaal €${tikkie.pendingAmount.toFixed(2)} vóór ${tikkie.nextDue.toLocaleString('nl-NL', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}`,
+              duration: 8000
+            });
+          }
           setCurrentUser(data);
           loadOrderScreen();
         } else {
@@ -233,17 +305,105 @@ const Index = () => {
     }
   };
 
-  const promptAdminCode = () => {
+  // Kijkt of iemand openstaande (onbetaalde) tikkies heeft, en of de
+  // betaaltermijn daarvan al verlopen is. Bij een fout (bv. tabellen nog
+  // niet aangemaakt) wordt niemand geblokkeerd.
+  const getTikkieStatus = async (userCode: string) => {
+    const result = { overdueAmount: 0, pendingAmount: 0, nextDue: null as Date | null };
+    try {
+      const { data: items, error } = await supabase
+        .from('settlement_items_2025_10_08_21_03')
+        .select('*')
+        .eq('user_code', userCode)
+        .eq('paid', false);
+      if (error || !items || items.length === 0) return result;
+
+      const ids = [...new Set(items.map(i => i.settlement_id))];
+      const { data: sets, error: setsError } = await supabase
+        .from('settlements_2025_10_08_21_03')
+        .select('*')
+        .in('id', ids);
+      if (setsError || !sets) return result;
+
+      const now = new Date();
+      for (const item of items) {
+        const s = sets.find(x => x.id === item.settlement_id);
+        if (!s) continue;
+        const due = new Date(s.due_at);
+        if (due <= now) {
+          result.overdueAmount += Number(item.amount);
+        } else {
+          result.pendingAmount += Number(item.amount);
+          if (!result.nextDue || due < result.nextDue) result.nextDue = due;
+        }
+      }
+    } catch (error) {
+      // stil negeren: liever iemand laten bestellen dan onterecht blokkeren
+    }
+    return result;
+  };
+
+  // Stil (zonder laadscherm) ophalen, zodat de rode teller bij "Tikkies"
+  // meteen klopt zodra je in Beheer komt.
+  const refreshSettlements = async () => {
+    try {
+      const [st, it] = await Promise.all([
+        supabase.from('settlements_2025_10_08_21_03').select('*').order('created_at', { ascending: false }),
+        supabase.from('settlement_items_2025_10_08_21_03').select('*').order('user_name', { ascending: true }),
+      ]);
+      if (!st.error && !it.error) {
+        setSettlements(st.data || []);
+        setSettlementItems(it.data || []);
+      }
+    } catch (error) {
+      // tabellen nog niet aanwezig: geen teller
+    }
+  };
+
+  const promptAdminCode = async () => {
     const code = prompt("Voer de beheercode in:");
-    if (code === 'BHV123') {
+    if (code === null) return; // geannuleerd
+
+    if (code === MAIN_ADMIN_CODE) {
+      setIsMainAdmin(true);
+      setAdminName('Admin');
+      setAdminPermissions(ALL_PERMISSIONS);
+      setMissingItemForm(prev => ({ ...prev, reported_by: 'Admin' }));
       setCurrentScreen('admin');
       setAdminSection('');
-    } else {
+      refreshSettlements();
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { data } = code
+        ? await supabase.from('admin_codes_2025_10_08_21_03').select('*').eq('code', code).maybeSingle()
+        : { data: null };
+      if (data) {
+        setIsMainAdmin(false);
+        setAdminName(data.name);
+        setAdminPermissions(Array.isArray(data.permissions) ? data.permissions : ALL_PERMISSIONS);
+        setMissingItemForm(prev => ({ ...prev, reported_by: data.name }));
+        setCurrentScreen('admin');
+        setAdminSection('');
+        refreshSettlements();
+        toast({ title: `Welkom ${data.name}`, description: "Ingelogd als beheerder" });
+      } else {
+        toast({
+          title: "Fout",
+          description: "Ongeldige beheercode",
+          variant: "destructive"
+        });
+      }
+    } catch (error) {
       toast({
         title: "Fout",
         description: "Ongeldige beheercode",
         variant: "destructive"
       });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -338,9 +498,20 @@ const Index = () => {
 
     setLoading(true);
     try {
+      // Is de betaaltermijn van een tikkie intussen verlopen? Dan niet meer bestellen.
+      const tikkie = await getTikkieStatus(currentUser.code);
+      if (tikkie.overdueAmount > 0) {
+        setShowConfirmOrder(false);
+        setCart([]);
+        setTikkieBlock({ amount: tikkie.overdueAmount });
+        setCurrentScreen('start');
+        setCurrentUser(null);
+        return;
+      }
+
       // Alle voorraad- en bestel-writes gelijktijdig versturen in plaats
       // van na elkaar te wachten op elk item.
-      await Promise.all(
+      const results = await Promise.all(
         cart.flatMap(item => {
           const product = products.find(p => p.id === item.id)!;
           return [
@@ -360,6 +531,9 @@ const Index = () => {
         })
       );
 
+      const failed = results.find(r => r.error);
+      if (failed?.error) throw failed.error;
+
       toast({
         title: "Succes! 🎉",
         description: "Bestelling succesvol geplaatst!",
@@ -367,7 +541,24 @@ const Index = () => {
 
       setCart([]);
       setShowConfirmOrder(false);
-      setShowLockCodeDialog(true);
+
+      // Slotcode-popup alleen tonen als de beheerder die aan heeft staan.
+      // Vers ophalen, want de instelling kan op een ander apparaat zijn gewijzigd.
+      let showCode = true;
+      try {
+        const { data } = await supabase
+          .from('app_settings_2025_10_08_21_03')
+          .select('lock_code_enabled')
+          .eq('id', 1)
+          .single();
+        if (data && data.lock_code_enabled === false) showCode = false;
+      } catch (e) {
+        // instelling onbekend: veilig terugvallen op tonen
+      }
+
+      // Eerst een korte bedankt-animatie; daarna de slotcode (of terug naar start).
+      setThankYouShowsCode(showCode);
+      setShowThankYou(true);
     } catch (error) {
       toast({
         title: "Fout",
@@ -378,6 +569,24 @@ const Index = () => {
       setLoading(false);
     }
   };
+
+  // Sluit de bedankt-animatie af (vanzelf na een paar seconden, of door erop te tikken).
+  const finishThankYou = () => {
+    setShowThankYou(false);
+    if (thankYouShowsCode) {
+      setShowLockCodeDialog(true);
+    } else {
+      setCurrentScreen('start');
+      setCurrentUser(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!showThankYou) return;
+    const t = setTimeout(finishThankYou, 3200);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showThankYou]);
 
   const closeLockCodeDialog = () => {
     setShowLockCodeDialog(false);
@@ -500,10 +709,10 @@ const Index = () => {
     }
   };
 
-  // ---------- Onderhoudsmodus ----------
-  // Staat in een eigen instellingen-tabel zodat elk apparaat (niet alleen
-  // dit scherm) dezelfde status ziet, ook nadat iemand anders 'm heeft
-  // aan- of uitgezet.
+  // ---------- App-instellingen (onderhoudsmodus, slotcode-popup) ----------
+  // Staan in een eigen instellingen-tabel zodat elk apparaat (niet alleen
+  // dit scherm) dezelfde status ziet, ook nadat iemand anders ze heeft
+  // gewijzigd.
   const loadSettings = async () => {
     try {
       const { data } = await supabase
@@ -514,21 +723,29 @@ const Index = () => {
       if (data) {
         setMaintenanceMode(!!data.maintenance_mode);
         if (data.maintenance_message) setMaintenanceMessage(data.maintenance_message);
+        setLockCodeEnabled(data.lock_code_enabled !== false);
       }
     } catch (error) {
       // Instellingen-tabel bestaat nog niet of is niet bereikbaar:
-      // gewoon stil negeren, onderhoudsmodus blijft dan uit.
+      // gewoon stil negeren, standaardwaarden blijven dan gelden.
     }
+  };
+
+  // Schrijft een instelling weg en gooit een fout als dat mislukt, zodat de
+  // schakelaar niet "aan" blijft staan terwijl de database niets opsloeg.
+  const updateSetting = async (patch: Record<string, unknown>) => {
+    const { error } = await supabase
+      .from('app_settings_2025_10_08_21_03')
+      .update({ ...patch, updated_at: new Date().toISOString() })
+      .eq('id', 1);
+    if (error) throw error;
   };
 
   const toggleMaintenanceMode = async () => {
     const newValue = !maintenanceMode;
     setLoading(true);
     try {
-      await supabase
-        .from('app_settings_2025_10_08_21_03')
-        .update({ maintenance_mode: newValue, updated_at: new Date().toISOString() })
-        .eq('id', 1);
+      await updateSetting({ maintenance_mode: newValue });
       setMaintenanceMode(newValue);
       toast({
         title: "Succes",
@@ -540,6 +757,205 @@ const Index = () => {
         description: "Kon onderhoudsmodus niet wijzigen",
         variant: "destructive"
       });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleLockCodeEnabled = async () => {
+    const newValue = !lockCodeEnabled;
+    setLoading(true);
+    try {
+      await updateSetting({ lock_code_enabled: newValue });
+      setLockCodeEnabled(newValue);
+      toast({
+        title: "Succes",
+        description: newValue
+          ? "De slotcode wordt weer getoond na een bestelling"
+          : "De slotcode wordt na een bestelling niet meer getoond"
+      });
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon instelling niet wijzigen (is het SQL-script al gedraaid?)",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ---------- Extra beheercodes (alleen hoofdbeheerder) ----------
+  const loadAdminCodes = async () => {
+    setLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('admin_codes_2025_10_08_21_03')
+        .select('*')
+        .order('created_at', { ascending: true });
+      if (error) throw error;
+      setAdminCodes(data || []);
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon beheercodes niet laden (is het SQL-script al gedraaid?)",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addAdminCode = async (name: string, code: string, permissions: string[]) => {
+    const cleanName = name.trim();
+    const cleanCode = code.trim();
+    if (!cleanName || !cleanCode) {
+      toast({ title: "Fout", description: "Vul een naam en een code in", variant: "destructive" });
+      return;
+    }
+    if (cleanCode === MAIN_ADMIN_CODE) {
+      toast({ title: "Fout", description: "Deze code is al in gebruik", variant: "destructive" });
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const { error } = await supabase
+        .from('admin_codes_2025_10_08_21_03')
+        .insert({ name: cleanName, code: cleanCode, permissions });
+      if (error) {
+        if (error.code === '23505') {
+          toast({ title: "Fout", description: "Deze code is al in gebruik, kies een andere", variant: "destructive" });
+          return;
+        }
+        throw error;
+      }
+      await loadAdminCodes();
+      toast({ title: "Succes", description: `Beheercode voor ${cleanName} aangemaakt` });
+    } catch (error) {
+      toast({ title: "Fout", description: "Kon beheercode niet aanmaken", variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateAdminPermissions = async (id: number, permissions: string[]) => {
+    try {
+      const { error } = await supabase
+        .from('admin_codes_2025_10_08_21_03')
+        .update({ permissions })
+        .eq('id', id);
+      if (error) throw error;
+      setAdminCodes(prev => prev.map(a => (a.id === id ? { ...a, permissions } : a)));
+    } catch (error) {
+      toast({ title: "Fout", description: "Kon rechten niet opslaan (is het SQL-script al gedraaid?)", variant: "destructive" });
+    }
+  };
+
+  const deleteAdminCode = async (id: number) => {
+    if (!confirm("Weet je zeker dat je deze beheercode wilt verwijderen? Deze beheerder kan daarna niet meer inloggen.")) return;
+
+    setLoading(true);
+    try {
+      const { error } = await supabase.from('admin_codes_2025_10_08_21_03').delete().eq('id', id);
+      if (error) throw error;
+      await loadAdminCodes();
+      toast({ title: "Succes", description: "Beheercode verwijderd" });
+    } catch (error) {
+      toast({ title: "Fout", description: "Kon beheercode niet verwijderen", variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ---------- Tikkie-afrekeningen ----------
+  // Laadt in één keer alles wat het Tikkie-scherm nodig heeft.
+  const loadSettlementData = async () => {
+    setLoading(true);
+    try {
+      const [o, u, s, i] = await Promise.all([
+        supabase.from('orders_2025_10_08_21_03').select('*'),
+        supabase.from('users_2025_10_08_21_03').select('*'),
+        supabase.from('settlements_2025_10_08_21_03').select('*').order('created_at', { ascending: false }),
+        supabase.from('settlement_items_2025_10_08_21_03').select('*').order('user_name', { ascending: true }),
+      ]);
+      setOrders(o.data || []);
+      setUsers(u.data || []);
+      if (s.error || i.error) throw (s.error || i.error);
+      setSettlements(s.data || []);
+      setSettlementItems(i.data || []);
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon tikkie-gegevens niet laden (is het SQL-script al gedraaid?)",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Zet de huidige stand vast (in één databasetransactie): per gebruiker
+  // wordt het bedrag vastgelegd, de huidige bestellingen worden aan deze
+  // afrekening gekoppeld en de lopende bestelgeschiedenis begint opnieuw.
+  const createSettlement = async (dueAt: Date) => {
+    if (isNaN(dueAt.getTime())) {
+      toast({ title: "Fout", description: "Kies een geldige betaaltermijn", variant: "destructive" });
+      return;
+    }
+    if (!confirm("Weet je zeker dat je de huidige stand wilt vastzetten?\n\nDe huidige bestelgeschiedenis begint daarna opnieuw.")) return;
+
+    setLoading(true);
+    try {
+      const { error } = await supabase.rpc('create_settlement', { p_due_at: dueAt.toISOString() });
+      if (error) throw error;
+      await loadSettlementData();
+      toast({ title: "Vastgezet", description: "De afrekening staat klaar. De bestelgeschiedenis begint opnieuw.", duration: 6000 });
+    } catch (error: any) {
+      toast({
+        title: "Fout",
+        description: error?.message?.includes('Geen openstaande')
+          ? "Er zijn geen openstaande bestellingen om vast te zetten"
+          : "Kon de stand niet vastzetten (is het SQL-script al gedraaid?)",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const setItemPaid = async (itemId: number, paid: boolean) => {
+    setLoading(true);
+    try {
+      const { error } = await supabase
+        .from('settlement_items_2025_10_08_21_03')
+        .update({ paid, paid_at: paid ? new Date().toISOString() : null })
+        .eq('id', itemId);
+      if (error) throw error;
+      await loadSettlementData();
+    } catch (error) {
+      toast({ title: "Fout", description: "Kon betaalstatus niet wijzigen", variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateSettlementDue = async (settlementId: number, dueAt: Date) => {
+    if (isNaN(dueAt.getTime())) {
+      toast({ title: "Fout", description: "Kies een geldige betaaltermijn", variant: "destructive" });
+      return;
+    }
+    setLoading(true);
+    try {
+      const { error } = await supabase
+        .from('settlements_2025_10_08_21_03')
+        .update({ due_at: dueAt.toISOString() })
+        .eq('id', settlementId);
+      if (error) throw error;
+      await loadSettlementData();
+      toast({ title: "Succes", description: "Betaaltermijn aangepast" });
+    } catch (error) {
+      toast({ title: "Fout", description: "Kon betaaltermijn niet aanpassen", variant: "destructive" });
     } finally {
       setLoading(false);
     }
@@ -822,7 +1238,7 @@ const Index = () => {
         setProducts(data || []);
       }
 
-      setMissingItemForm({ product_name: '', quantity: 1, reason: '', reported_by: 'Admin' });
+      setMissingItemForm({ product_name: '', quantity: 1, reason: '', reported_by: adminName });
       setShowMissingItemDialog(false);
       await loadMissingItems();
       toast({ title: "Succes", description: "Verdwenen goederen geregistreerd" });
@@ -838,11 +1254,15 @@ const Index = () => {
   };
 
   const clearAllOrders = async () => {
-    if (!confirm("Weet je zeker dat je alle bestellingen wilt verwijderen?\n\nLet op: De maandelijkse omzet blijft behouden voor historische doeleinden.")) return;
+    if (!confirm("Weet je zeker dat je alle lopende bestellingen wilt verwijderen?\n\nLet op: De maandelijkse omzet blijft behouden en vastgezette tikkie-afrekeningen blijven staan.")) return;
 
     setLoading(true);
     try {
-      await supabase.from('orders_2025_10_08_21_03').delete().neq('id', 0);
+      const { error: clearError } = await supabase
+        .from('orders_2025_10_08_21_03')
+        .delete()
+        .is('settlement_id', null);
+      if (clearError) throw clearError;
       await loadOrders();
       toast({
         title: "Succes", 
@@ -1083,6 +1503,27 @@ const Index = () => {
             </DialogFooter>
           </DialogContent>
         </Dialog>
+
+        {/* Geblokkeerd door onbetaalde tikkie */}
+        <Dialog open={tikkieBlock !== null} onOpenChange={(open) => { if (!open) setTikkieBlock(null); }}>
+          <DialogContent className="bar-card">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2 text-destructive">
+                <Wallet className="h-5 w-5" />
+                Eerst je tikkie betalen
+              </DialogTitle>
+              <DialogDescription>
+                Je hebt een openstaande tikkie van €{tikkieBlock?.amount.toFixed(2)} die niet op tijd is betaald.
+                Bestellen kan pas weer nadat je die hebt betaald. Zet je drinken voor nu terug.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button onClick={() => setTikkieBlock(null)} className="w-full glow-effect">
+                Begrepen
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     );
   }
@@ -1300,6 +1741,27 @@ const Index = () => {
           </DialogContent>
         </Dialog>
 
+        {/* Bedankt-animatie na een bestelling */}
+        {showThankYou && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-background/90 backdrop-blur-sm animate-fade-in cursor-pointer"
+            onClick={finishThankYou}
+            role="status"
+            aria-live="polite"
+          >
+            <div className="text-center space-y-4 px-6">
+              <svg className="mx-auto h-28 w-28 animate-bounce-in" viewBox="0 0 52 52" aria-hidden="true">
+                <circle cx="26" cy="26" r="24" fill="none" stroke="hsl(var(--primary))" strokeWidth="3" />
+                <path className="thank-you-check" d="M15 27 l8 8 l15 -17" fill="none" stroke="hsl(var(--primary))" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              <h2 className="text-4xl font-bold gradient-text animate-slide-up">Bedankt{currentUser ? `, ${currentUser.name}` : ''}!</h2>
+              <p className="text-xl text-muted-foreground animate-slide-up">
+                Tot ziens <span className="inline-block origin-bottom-right animate-wave" aria-hidden="true">👋</span>
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Weekly Lock Code Dialog */}
         <Dialog open={showLockCodeDialog} onOpenChange={(open) => { if (!open) closeLockCodeDialog(); }}>
           <DialogContent className="bar-card">
@@ -1348,14 +1810,19 @@ const Index = () => {
       <div className="min-h-screen bg-gradient-to-br from-background via-muted to-background p-4 animate-fade-in">
         <div className="max-w-6xl mx-auto space-y-6">
           <div className="flex justify-between items-center animate-slide-up">
-            <h1 className="text-3xl font-bold gradient-text">⚙️ Beheer</h1>
+            <div>
+              <h1 className="text-3xl font-bold gradient-text">⚙️ Beheer</h1>
+              <p className="text-sm text-muted-foreground">
+                Ingelogd als {isMainAdmin ? 'hoofdbeheerder' : adminName}
+              </p>
+            </div>
             <Button onClick={() => setCurrentScreen('start')} variant="outline" className="bar-button">
               Terug naar start
             </Button>
           </div>
 
           {/* Slotcode + Onderhoudsmodus */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-slide-up">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 animate-slide-up">
             <Card className="bar-card">
               <CardContent className="p-4 flex items-center justify-between gap-4">
                 <div>
@@ -1375,6 +1842,25 @@ const Index = () => {
               <CardContent className="p-4 flex items-center justify-between gap-4">
                 <div>
                   <p className="text-sm font-medium flex items-center gap-2">
+                    <Lock className="h-4 w-4" />
+                    Slotcode na bestelling
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {lockCodeEnabled ? "Aan — wordt getoond na elke bestelling" : "Uit — popup na bestelling is uitgeschakeld"}
+                  </p>
+                </div>
+                <Switch
+                  checked={lockCodeEnabled}
+                  onCheckedChange={toggleLockCodeEnabled}
+                  disabled={loading || !can('settings')}
+                />
+              </CardContent>
+            </Card>
+
+            <Card className="bar-card">
+              <CardContent className="p-4 flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-sm font-medium flex items-center gap-2">
                     <AlertTriangle className="h-4 w-4" />
                     Onderhoudsmodus
                   </p>
@@ -1386,7 +1872,7 @@ const Index = () => {
                 <Switch
                   checked={maintenanceMode}
                   onCheckedChange={toggleMaintenanceMode}
-                  disabled={loading}
+                  disabled={loading || !can('settings')}
                 />
               </CardContent>
             </Card>
@@ -1406,6 +1892,7 @@ const Index = () => {
 
           {/* Admin Menu */}
           <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 animate-slide-up ${showMobileMenu ? 'block' : 'hidden md:grid'}`}>
+            {can('users') && (
             <Button
               onClick={() => { setAdminSection('users'); loadUsers(); setShowMobileMenu(false); }}
               variant={adminSection === 'users' ? 'default' : 'outline'}
@@ -1419,6 +1906,8 @@ const Index = () => {
                 </Badge>
               )}
             </Button>
+            )}
+            {can('products') && (
             <Button 
               onClick={() => { setAdminSection('products'); loadProducts(); setShowMobileMenu(false); }} 
               variant={adminSection === 'products' ? 'default' : 'outline'}
@@ -1427,6 +1916,8 @@ const Index = () => {
               <Package className="mr-2 h-5 w-5" />
               Voorraadbeheer
             </Button>
+            )}
+            {can('orders') && (
             <Button 
               onClick={() => { setAdminSection('orders'); loadOrders(); setShowMobileMenu(false); }} 
               variant={adminSection === 'orders' ? 'default' : 'outline'}
@@ -1435,6 +1926,8 @@ const Index = () => {
               <ShoppingCart className="mr-2 h-5 w-5" />
               Bestelgeschiedenis
             </Button>
+            )}
+            {can('revenue') && (
             <Button 
               onClick={() => { setAdminSection('revenue'); loadRevenueData(); setShowMobileMenu(false); }}
               variant={adminSection === 'revenue' ? 'default' : 'outline'}
@@ -1443,6 +1936,8 @@ const Index = () => {
               <BarChart3 className="mr-2 h-5 w-5" />
               Omzet
             </Button>
+            )}
+            {can('missing') && (
             <Button 
               onClick={() => { setAdminSection('missing'); loadMissingItems(); setShowMobileMenu(false); }} 
               variant={adminSection === 'missing' ? 'default' : 'outline'}
@@ -1451,10 +1946,36 @@ const Index = () => {
               <AlertTriangle className="mr-2 h-5 w-5" />
               Verdwenen goederen
             </Button>
+            )}
+            {can('settlements') && (
+            <Button
+              onClick={() => { setAdminSection('settlements'); loadSettlementData(); setShowMobileMenu(false); }}
+              variant={adminSection === 'settlements' ? 'default' : 'outline'}
+              className="h-20 bar-button relative"
+            >
+              <Wallet className="mr-2 h-5 w-5" />
+              Tikkies
+              {settlementItems.filter(i => !i.paid && settlements.some(st => st.id === i.settlement_id && new Date(st.due_at) <= new Date())).length > 0 && (
+                <Badge variant="destructive" className="absolute -top-2 -right-2">
+                  {settlementItems.filter(i => !i.paid && settlements.some(st => st.id === i.settlement_id && new Date(st.due_at) <= new Date())).length}
+                </Badge>
+              )}
+            </Button>
+            )}
+            {isMainAdmin && (
+              <Button
+                onClick={() => { setAdminSection('admincodes'); loadAdminCodes(); setShowMobileMenu(false); }}
+                variant={adminSection === 'admincodes' ? 'default' : 'outline'}
+                className="h-20 bar-button"
+              >
+                <KeyRound className="mr-2 h-5 w-5" />
+                Beheerders
+              </Button>
+            )}
           </div>
 
           {/* Admin Sections */}
-          {adminSection === 'users' && (
+          {adminSection === 'users' && can('users') && (
             <UserManagement
               users={filteredUsers.filter(u => u.status !== 'pending')}
               pendingUsers={users.filter(u => u.status === 'pending')}
@@ -1468,7 +1989,7 @@ const Index = () => {
             />
           )}
 
-          {adminSection === 'products' && (
+          {adminSection === 'products' && can('products') && (
             <ProductManagement 
               products={products} 
               onAddProduct={addProduct} 
@@ -1479,9 +2000,9 @@ const Index = () => {
             />
           )}
 
-          {adminSection === 'orders' && (
+          {adminSection === 'orders' && can('orders') && (
             <OrderHistory 
-              orders={orders} 
+              orders={orders.filter(o => !o.settlement_id)} 
               users={users} 
               onClearOrders={clearAllOrders}
               onGenerateReceipt={generateReceipt}
@@ -1489,7 +2010,7 @@ const Index = () => {
             />
           )}
 
-          {adminSection === 'revenue' && (
+          {adminSection === 'revenue' && can('revenue') && (
             <RevenueSection 
               monthlyRevenue={getMonthlyRevenue()} 
               productRevenue={getRevenueByProduct()}
@@ -1497,10 +2018,33 @@ const Index = () => {
             />
           )}
 
-          {adminSection === 'missing' && (
+          {adminSection === 'missing' && can('missing') && (
             <MissingItemsSection 
               missingItems={missingItems} 
               onReportMissing={() => setShowMissingItemDialog(true)}
+              loading={loading}
+            />
+          )}
+
+          {adminSection === 'settlements' && can('settlements') && (
+            <SettlementSection
+              currentOrders={orders.filter(o => !o.settlement_id)}
+              users={users}
+              settlements={settlements}
+              items={settlementItems}
+              onCreate={createSettlement}
+              onSetPaid={setItemPaid}
+              onUpdateDue={updateSettlementDue}
+              loading={loading}
+            />
+          )}
+
+          {adminSection === 'admincodes' && isMainAdmin && (
+            <AdminCodeManagement
+              adminCodes={adminCodes}
+              onAdd={addAdminCode}
+              onUpdatePermissions={updateAdminPermissions}
+              onDelete={deleteAdminCode}
               loading={loading}
             />
           )}
@@ -2342,6 +2886,301 @@ const MissingItemsSection = ({ missingItems, onReportMissing, loading }: {
             )}
           </div>
         )}
+      </CardContent>
+    </Card>
+  );
+};
+
+// ---------- Hulpjes voor betaaltermijnen ----------
+const toLocalInput = (d: Date) => {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+const formatRemaining = (due: Date, now: Date) => {
+  const ms = due.getTime() - now.getTime();
+  if (ms <= 0) return 'Verlopen';
+  const mins = Math.floor(ms / 60000);
+  const d = Math.floor(mins / 1440);
+  const h = Math.floor((mins % 1440) / 60);
+  const m = mins % 60;
+  if (d > 0) return `Nog ${d} d ${h} u`;
+  if (h > 0) return `Nog ${h} u ${m} min`;
+  return `Nog ${m} min`;
+};
+
+// Component for Tikkie settlements
+const SettlementSection = ({ currentOrders, users, settlements, items, onCreate, onSetPaid, onUpdateDue, loading }: {
+  currentOrders: Order[];
+  users: User[];
+  settlements: Settlement[];
+  items: SettlementItem[];
+  onCreate: (dueAt: Date) => void;
+  onSetPaid: (itemId: number, paid: boolean) => void;
+  onUpdateDue: (settlementId: number, dueAt: Date) => void;
+  loading: boolean;
+}) => {
+  const [now, setNow] = useState(() => new Date());
+  const [dueInput, setDueInput] = useState(() => toLocalInput(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)));
+  const [dueEdits, setDueEdits] = useState<{ [id: number]: string }>({});
+
+  // Houdt de aftelling en de "verlopen"-status actueel.
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  const userMap = Object.fromEntries(users.map(u => [u.code, u.name]));
+  const standing = Object.entries(
+    currentOrders.reduce((acc, o) => {
+      acc[o.user_code] = (acc[o.user_code] || 0) + o.price * o.quantity;
+      return acc;
+    }, {} as { [code: string]: number })
+  ).sort(([, a], [, b]) => b - a);
+  const standingTotal = standing.reduce((sum, [, amount]) => sum + amount, 0);
+
+  return (
+    <div className="space-y-6 animate-slide-up">
+      <Card className="bar-card">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Wallet className="h-5 w-5" />
+            Huidige stand vastzetten
+          </CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Zet de openstaande bedragen vast voor de tikkies. De lopende bestelgeschiedenis begint daarna opnieuw.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {standing.length === 0 ? (
+            <p className="text-center text-muted-foreground py-2">Geen openstaande bestellingen</p>
+          ) : (
+            <div className="space-y-2 max-h-64 overflow-y-auto">
+              {standing.map(([code, amount]) => (
+                <div key={code} className="flex justify-between items-center p-3 border rounded-lg bg-card/50">
+                  <span className="font-medium">{userMap[code] || 'Onbekend'} <span className="text-xs text-muted-foreground">({code})</span></span>
+                  <Badge variant="secondary" className="text-base">€{amount.toFixed(2)}</Badge>
+                </div>
+              ))}
+              <div className="flex justify-between items-center p-3 bg-primary/10 rounded-lg font-semibold">
+                <span>Totaal</span>
+                <span>€{standingTotal.toFixed(2)}</span>
+              </div>
+            </div>
+          )}
+          <div className="flex flex-col sm:flex-row sm:items-end gap-3">
+            <div className="flex-1">
+              <label className="text-sm font-medium flex items-center gap-2 mb-1">
+                <Clock className="h-4 w-4" />
+                Betalen vóór
+              </label>
+              <Input
+                type="datetime-local"
+                value={dueInput}
+                onChange={(e) => setDueInput(e.target.value)}
+              />
+            </div>
+            <Button
+              onClick={() => onCreate(new Date(dueInput))}
+              disabled={loading || standing.length === 0 || !dueInput}
+              className="bar-button glow-effect"
+            >
+              Stand vastzetten
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Wie na deze datum nog niet is afgevinkt als betaald, kan niet meer bestellen en krijgt de melding om eerst de tikkie te betalen.
+          </p>
+        </CardContent>
+      </Card>
+
+      {settlements.length === 0 && (
+        <p className="text-center text-muted-foreground py-4">Nog geen afrekeningen vastgezet</p>
+      )}
+
+      {settlements.map(st => {
+        const stItems = items.filter(i => i.settlement_id === st.id);
+        const due = new Date(st.due_at);
+        const overdue = due <= now;
+        const total = stItems.reduce((sum, i) => sum + Number(i.amount), 0);
+        const open = stItems.filter(i => !i.paid).reduce((sum, i) => sum + Number(i.amount), 0);
+        const editValue = dueEdits[st.id] ?? toLocalInput(due);
+        const dueChanged = editValue !== toLocalInput(due);
+
+        return (
+          <Card key={st.id} className="bar-card">
+            <CardHeader>
+              <CardTitle className="flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  Afrekening van {new Date(st.created_at).toLocaleDateString('nl-NL', { day: 'numeric', month: 'long', year: 'numeric' })}
+                </span>
+                {open === 0 ? (
+                  <Badge variant="secondary">Alles betaald</Badge>
+                ) : (
+                  <Badge variant={overdue ? 'destructive' : 'outline'} className="flex items-center gap-1">
+                    <Clock className="h-3 w-3" />
+                    {formatRemaining(due, now)}
+                  </Badge>
+                )}
+              </CardTitle>
+              <p className="text-sm text-muted-foreground">
+                Totaal €{total.toFixed(2)} · nog open €{open.toFixed(2)}
+              </p>
+              <div className="flex flex-col sm:flex-row sm:items-end gap-2 pt-2">
+                <div className="flex-1">
+                  <label className="text-xs font-medium text-muted-foreground">Betalen vóór</label>
+                  <Input
+                    type="datetime-local"
+                    value={editValue}
+                    onChange={(e) => setDueEdits(prev => ({ ...prev, [st.id]: e.target.value }))}
+                  />
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={loading || !dueChanged}
+                  onClick={() => {
+                    onUpdateDue(st.id, new Date(editValue));
+                    setDueEdits(prev => { const { [st.id]: _removed, ...rest } = prev; return rest; });
+                  }}
+                >
+                  Termijn opslaan
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-2">
+                {stItems.map(item => {
+                  const blocked = !item.paid && overdue;
+                  return (
+                    <div
+                      key={item.id}
+                      className={`flex justify-between items-center p-3 border rounded-lg ${blocked ? 'bg-destructive/5 border-destructive/40' : 'bg-card/50'}`}
+                    >
+                      <div>
+                        <span className="font-medium">{item.user_name}</span>
+                        <span className="ml-2 text-sm text-muted-foreground">€{Number(item.amount).toFixed(2)}</span>
+                        {blocked && <Badge variant="destructive" className="ml-2">Geblokkeerd</Badge>}
+                      </div>
+                      <label className="flex items-center gap-2 text-sm">
+                        {item.paid ? 'Betaald' : 'Niet betaald'}
+                        <Switch
+                          checked={item.paid}
+                          onCheckedChange={(checked) => onSetPaid(item.id, checked)}
+                          disabled={loading}
+                        />
+                      </label>
+                    </div>
+                  );
+                })}
+                {stItems.length === 0 && (
+                  <p className="text-center text-muted-foreground py-2">Geen bedragen in deze afrekening</p>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+        );
+      })}
+    </div>
+  );
+};
+
+// Component for extra admin codes (only the main admin sees this)
+const AdminCodeManagement = ({ adminCodes, onAdd, onUpdatePermissions, onDelete, loading }: {
+  adminCodes: AdminCode[];
+  onAdd: (name: string, code: string, permissions: string[]) => void;
+  onUpdatePermissions: (id: number, permissions: string[]) => void;
+  onDelete: (id: number) => void;
+  loading: boolean;
+}) => {
+  const [form, setForm] = useState({ name: '', code: '' });
+  const [newPermissions, setNewPermissions] = useState<string[]>(ALL_PERMISSIONS);
+
+  const toggle = (list: string[], key: string, on: boolean) =>
+    on ? [...new Set([...list, key])] : list.filter(k => k !== key);
+
+  return (
+    <Card className="bar-card animate-slide-up">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <KeyRound className="h-5 w-5" />
+          Beheerders ({adminCodes.length + 1})
+        </CardTitle>
+        <p className="text-sm text-muted-foreground">
+          Jij blijft hoofdbeheerder en kunt alles. Per beheerder bepaal je hieronder welke onderdelen die mag gebruiken. Beheercodes aanmaken of verwijderen kan alleen jij.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-3">
+          <div className="flex justify-between items-center p-3 border rounded-lg bg-primary/10">
+            <span className="font-medium">Hoofdbeheerder</span>
+            <Badge variant="secondary">Jij · alle rechten</Badge>
+          </div>
+          {adminCodes.map(a => {
+            const perms = Array.isArray(a.permissions) ? a.permissions : ALL_PERMISSIONS;
+            return (
+              <div key={a.id} className="p-3 border rounded-lg bg-card/50 space-y-3">
+                <div className="flex justify-between items-center">
+                  <div>
+                    <span className="font-medium">{a.name}</span>
+                    <Badge variant="secondary" className="ml-2">{a.code}</Badge>
+                  </div>
+                  <Button variant="destructive" size="sm" onClick={() => onDelete(a.id)} disabled={loading} className="bar-button">
+                    Verwijder
+                  </Button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {ADMIN_PERMISSIONS.map(perm => (
+                    <label key={perm.key} className="flex items-center justify-between gap-2 text-sm p-2 rounded bg-muted/30">
+                      {perm.label}
+                      <Switch
+                        checked={perms.includes(perm.key)}
+                        onCheckedChange={(on) => onUpdatePermissions(a.id, toggle(perms, perm.key, on))}
+                        disabled={loading}
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          {adminCodes.length === 0 && (
+            <p className="text-center text-muted-foreground py-2">Nog geen extra beheerders</p>
+          )}
+        </div>
+        <Separator />
+        <div className="space-y-3">
+          <h4 className="font-medium">Nieuwe beheerder</h4>
+          <Input
+            placeholder="Naam"
+            value={form.name}
+            onChange={(e) => setForm(prev => ({ ...prev, name: e.target.value }))}
+          />
+          <Input
+            placeholder="Beheercode"
+            value={form.code}
+            onChange={(e) => setForm(prev => ({ ...prev, code: e.target.value }))}
+          />
+          <p className="text-sm font-medium">Wat mag deze beheerder?</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {ADMIN_PERMISSIONS.map(perm => (
+              <label key={perm.key} className="flex items-center justify-between gap-2 text-sm p-2 rounded bg-muted/30">
+                {perm.label}
+                <Switch
+                  checked={newPermissions.includes(perm.key)}
+                  onCheckedChange={(on) => setNewPermissions(prev => toggle(prev, perm.key, on))}
+                />
+              </label>
+            ))}
+          </div>
+          <Button
+            onClick={() => { onAdd(form.name, form.code, newPermissions); setForm({ name: '', code: '' }); }}
+            className="w-full bar-button glow-effect"
+            disabled={loading || !form.name.trim() || !form.code.trim()}
+          >
+            Beheercode aanmaken
+          </Button>
+        </div>
       </CardContent>
     </Card>
   );
