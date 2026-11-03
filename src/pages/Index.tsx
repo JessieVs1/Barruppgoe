@@ -23,6 +23,10 @@ const supabase = {
   rpc: (fn: string, args?: Record<string, unknown>) => activeClient.rpc(fn, args),
 } as unknown as typeof realSupabase;
 
+// Tijdens de testfase kan iedereen die deze code kent inloggen als
+// testgebruiker en de hele bestelflow doorlopen, zonder echte data aan te raken.
+const TEST_USER_CODE = 'TEST';
+
 // ---------- Wekelijkse slotcode (verandert elke donderdag) ----------
 // De code is volledig voorspelbaar uit de datum (geen database nodig):
 // iedereen die tussen donderdag en de volgende woensdag een bestelling
@@ -181,6 +185,7 @@ const Index = () => {
   const [testMode, setTestMode] = useState(false);
   const [sandboxActive, setSandboxActive] = useState(false);
   const [testUserCode, setTestUserCode] = useState('');
+  const [testGuestSession, setTestGuestSession] = useState(false);
   const [showThankYou, setShowThankYou] = useState(false);
   const [thankYouShowsCode, setThankYouShowsCode] = useState(true);
   const [adminCodes, setAdminCodes] = useState<AdminCode[]>([]);
@@ -228,6 +233,7 @@ const Index = () => {
       // Op het startscherm altijd weer met de echte database werken.
       activeClient = realSupabase;
       setSandboxActive(false);
+      setTestGuestSession(false);
     }
   }, [currentScreen]);
 
@@ -279,6 +285,10 @@ const Index = () => {
         // Tijdens de testfase kan er niet besteld worden (vers gecontroleerd).
         if (await fetchRealTestMode()) {
           setTestMode(true);
+          if (code.trim().toUpperCase() === TEST_USER_CODE) {
+            await startGuestTest();
+            return;
+          }
           toast({
             title: "Testfase actief",
             description: "Bestellen kan op dit moment niet. Probeer het later nog eens.",
@@ -427,6 +437,29 @@ const Index = () => {
   const resetSandbox = async () => {
     await enterSandbox();
     toast({ title: "Testdata gereset", description: "Je werkt weer met een verse kopie van de echte data." });
+  };
+
+  // Inloggen als testgebruiker op het gewone bestelscherm: de app werkt dan
+  // op een kopie van de data, dus echte voorraad en bestellingen blijven
+  // ongemoeid.
+  const startGuestTest = async () => {
+    await enterSandbox();
+    await supabase
+      .from('users_2025_10_08_21_03')
+      .insert({ name: 'Testgebruiker', code: TEST_USER_CODE, status: 'approved' });
+    const { data: testUser } = await supabase
+      .from('users_2025_10_08_21_03')
+      .select('*')
+      .eq('code', TEST_USER_CODE)
+      .single();
+    if (!testUser) {
+      toast({ title: "Fout", description: "Kon de testgebruiker niet aanmaken", variant: "destructive" });
+      return;
+    }
+    setTestGuestSession(true);
+    setCurrentUser(testUser);
+    await loadOrderScreen();
+    toast({ title: "Testgebruiker", description: "Je bestelt op een kopie. Niets wordt echt opgeslagen." });
   };
 
   // Een testbestelling plaatsen als een bestaande gebruiker (op de kopie).
@@ -668,7 +701,7 @@ const Index = () => {
         setShowConfirmOrder(false);
         setCart([]);
         setTikkieBlock({ amount: tikkie.overdueAmount });
-        setCurrentScreen(sandboxActive ? 'admin' : 'start');
+        setCurrentScreen(sandboxActive && !testGuestSession ? 'admin' : 'start');
         setCurrentUser(null);
         return;
       }
@@ -740,7 +773,7 @@ const Index = () => {
     if (thankYouShowsCode) {
       setShowLockCodeDialog(true);
     } else {
-      setCurrentScreen(sandboxActive ? 'admin' : 'start');
+      setCurrentScreen(sandboxActive && !testGuestSession ? 'admin' : 'start');
       setCurrentUser(null);
     }
   };
@@ -754,7 +787,7 @@ const Index = () => {
 
   const closeLockCodeDialog = () => {
     setShowLockCodeDialog(false);
-    setCurrentScreen(sandboxActive ? 'admin' : 'start');
+    setCurrentScreen(sandboxActive && !testGuestSession ? 'admin' : 'start');
     setCurrentUser(null);
   };
 
@@ -1641,10 +1674,10 @@ const Index = () => {
                 onClick={promptUserCode}
                 className="w-full bar-button glow-effect"
                 size="lg"
-                disabled={loading || testMode}
+                disabled={loading}
               >
                 <ShoppingCart className="mr-2 h-5 w-5" />
-                {loading ? "Laden..." : testMode ? "Bestellen (niet mogelijk)" : "Bestellen"}
+                {loading ? "Laden..." : "Bestellen"}
               </Button>
               <Button
                 onClick={() => setShowRegisterDialog(true)}
@@ -1880,12 +1913,12 @@ const Index = () => {
               {loading ? "Verwerken..." : "Bevestig bestelling"}
             </Button>
             <Button 
-              onClick={() => { setCurrentScreen(sandboxActive ? 'admin' : 'start'); setCurrentUser(null); setCart([]); }} 
+              onClick={() => { setCurrentScreen(sandboxActive && !testGuestSession ? 'admin' : 'start'); setCurrentUser(null); setCart([]); }} 
               variant="outline" 
               className="w-full bar-button"
               disabled={loading}
             >
-              {sandboxActive ? 'Terug naar beheer' : 'Terug naar start'}
+              {sandboxActive && !testGuestSession ? 'Terug naar beheer' : 'Terug naar start'}
             </Button>
           </div>
         </div>
