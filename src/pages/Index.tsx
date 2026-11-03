@@ -15,10 +15,12 @@ import { useToast } from '@/hooks/use-toast';
 // ---------- Testfase: nep-database in het geheugen ----------
 // Tijdens de testfase praat de app niet met Supabase maar met deze
 // "sandbox". Bij het starten wordt de echte data ALLEEN GELEZEN (select) en
-// gekopieerd naar het geheugen van de browser. Alle wijzigingen (bestellen,
-// voorraad, gebruikers, tikkies, ...) gebeuren op die kopie en verdwijnen
-// zodra de testfase stopt of de pagina wordt herladen. Er wordt nooit iets
-// naar de echte database geschreven.
+// gekopieerd. Alle wijzigingen (bestellen, voorraad, gebruikers, tikkies, ...)
+// gebeuren op die kopie. De kopie wordt bewaard in één aparte kolom
+// (app_settings.test_data), zodat testbestellingen blijven bestaan tussen
+// inlogmomenten en apparaten door, en je ook de tikkies kunt testen. Zodra de
+// testfase uitgaat wordt die kopie gewist. De echte tabellen worden nooit
+// aangeraakt.
 
 type SBRow = Record<string, any>;
 type SBStore = Record<string, SBRow[]>;
@@ -71,7 +73,26 @@ async function loadSandboxStore(real: any): Promise<SBStore> {
   [SBT.orders, SBT.missing, SBT.revenue, SBT.settlements, SBT.settlementItems].forEach(table => {
     store[table] = [];
   });
+  // De vorige testkopie zelf hoort niet in de nieuwe kopie terecht te komen.
+  store[SBT.settings] = (store[SBT.settings] || []).map(({ test_data, ...rest }) => rest);
+  // De testgebruiker bestaat alleen in de kopie.
+  const users = (store[SBT.users] = store[SBT.users] || []);
+  if (!users.some(u => u.code === TEST_USER_CODE)) {
+    users.push({
+      id: users.reduce((max, u) => Math.max(max, Number(u.id) || 0), 0) + 1,
+      name: 'Testgebruiker',
+      code: TEST_USER_CODE,
+      status: 'approved',
+      created_at: new Date().toISOString(),
+    });
+  }
   return store;
+}
+
+/** Hoe de testkopie wordt bewaard en teruggelezen (zie createSandboxClient). */
+interface SandboxPersistence {
+  load: () => Promise<SBStore | null>;
+  save: (store: SBStore) => Promise<void>;
 }
 
 const sbError = (message: string, code?: string) => ({ message, code, details: null, hint: null });
@@ -117,7 +138,11 @@ class SandboxQuery implements PromiseLike<any> {
   private sorts: Array<{ col: string; asc: boolean }> = [];
   private mode: 'many' | 'single' | 'maybe' = 'many';
 
-  constructor(private store: SBStore, private table: string) {}
+  constructor(
+    private store: SBStore,
+    private table: string,
+    private hooks?: { sync: () => Promise<void>; markDirty: () => void }
+  ) {}
 
   select(columns = '*') {
     if (this.op === 'select') this.columns = columns;
@@ -141,7 +166,12 @@ class SandboxQuery implements PromiseLike<any> {
     onrejected?: ((reason: any) => R2 | PromiseLike<R2>) | null
   ): PromiseLike<R1 | R2> {
     return Promise.resolve()
-      .then(() => this.run())
+      .then(() => this.hooks?.sync())
+      .then(() => {
+        const result = this.run();
+        if (this.op !== 'select') this.hooks?.markDirty();
+        return result;
+      })
       .then(onfulfilled as any, onrejected as any);
   }
 
@@ -236,38 +266,96 @@ class SandboxQuery implements PromiseLike<any> {
   }
 }
 
-/** Maakt een client met dezelfde from()/rpc()-vorm als supabase-js, maar volledig in het geheugen. */
-function createSandboxClient(store: SBStore) {
-  return {
-    from: (table: string) => new SandboxQuery(store, table),
-    rpc: async (fn: string, args?: Record<string, any>) => {
-      if (fn !== 'create_settlement') {
-        return { data: null, error: sbError(`Onbekende functie ${fn}`) };
-      }
-      const orders = store[SBT.orders] || [];
-      const open = orders.filter(o => o.settlement_id === null || o.settlement_id === undefined);
-      if (open.length === 0) {
-        return { data: null, error: sbError('Geen openstaande bestellingen') };
-      }
-      const settlements = (store[SBT.settlements] = store[SBT.settlements] || []);
-      const id = settlements.reduce((max, s) => Math.max(max, Number(s.id) || 0), 0) + 1;
-      settlements.push({ id, created_at: new Date().toISOString(), due_at: args?.p_due_at });
+/**
+ * Maakt een client met dezelfde from()/rpc()-vorm als supabase-js, maar
+ * werkend op een kopie in het geheugen. Met `persistence` wordt de kopie na
+ * elke wijziging bewaard en (kort voor een lees/schrijf-actie) opnieuw
+ * ingelezen, zodat een ander apparaat dezelfde testdata ziet.
+ */
+function createSandboxClient(store: SBStore, persistence?: SandboxPersistence) {
+  let dirty = false;
+  let lastSync = Date.now();
+  let timer: ReturnType<typeof setTimeout> | null = null;
 
-      const totals = new Map<string, number>();
-      open.forEach(o => totals.set(o.user_code, (totals.get(o.user_code) || 0) + Number(o.price) * Number(o.quantity)));
-      const items = (store[SBT.settlementItems] = store[SBT.settlementItems] || []);
-      let nextItemId = items.reduce((max, i) => Math.max(max, Number(i.id) || 0), 0) + 1;
-      totals.forEach((amount, code) => {
-        if (amount <= 0) return;
-        const user = (store[SBT.users] || []).find(u => u.code === code);
-        items.push({
-          id: nextItemId++, settlement_id: id, user_code: code,
-          user_name: user?.name ?? 'Onbekend', amount, paid: false, paid_at: null,
-        });
+  const saveNow = async () => {
+    if (!persistence) return;
+    if (timer) clearTimeout(timer);
+    timer = null;
+    dirty = false;
+    try {
+      await persistence.save(store);
+    } catch (e) {
+      // opslaan van testdata mislukt: de kopie blijft in het geheugen werken
+    }
+    lastSync = Date.now();
+  };
+
+  const flush = async () => {
+    if (dirty) await saveNow();
+  };
+
+  const markDirty = () => {
+    if (!persistence) return;
+    dirty = true;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(saveNow, 200);
+  };
+
+  // Haalt de bewaarde testdata op als een ander apparaat die intussen kan hebben gewijzigd.
+  const sync = async () => {
+    if (!persistence || dirty || Date.now() - lastSync < 1500) return;
+    lastSync = Date.now();
+    try {
+      const remote = await persistence.load();
+      if (remote && !dirty) {
+        Object.keys(store).forEach(k => { delete store[k]; });
+        Object.assign(store, remote);
+      }
+    } catch (e) {
+      // niet bereikbaar: met de lokale kopie doorgaan
+    }
+  };
+
+  const hooks = { sync, markDirty };
+
+  const rpc = async (fn: string, args?: Record<string, any>) => {
+    await sync();
+    if (fn !== 'create_settlement') {
+      return { data: null, error: sbError(`Onbekende functie ${fn}`) };
+    }
+    const orders = store[SBT.orders] || [];
+    const open = orders.filter(o => o.settlement_id === null || o.settlement_id === undefined);
+    if (open.length === 0) {
+      return { data: null, error: sbError('Geen openstaande bestellingen') };
+    }
+    const settlements = (store[SBT.settlements] = store[SBT.settlements] || []);
+    const id = settlements.reduce((max, st) => Math.max(max, Number(st.id) || 0), 0) + 1;
+    settlements.push({ id, created_at: new Date().toISOString(), due_at: args?.p_due_at });
+
+    const totals = new Map<string, number>();
+    open.forEach(o => totals.set(o.user_code, (totals.get(o.user_code) || 0) + Number(o.price) * Number(o.quantity)));
+    const items = (store[SBT.settlementItems] = store[SBT.settlementItems] || []);
+    let nextItemId = items.reduce((max, i) => Math.max(max, Number(i.id) || 0), 0) + 1;
+    totals.forEach((amount, code) => {
+      if (amount <= 0) return;
+      const user = (store[SBT.users] || []).find(u => u.code === code);
+      items.push({
+        id: nextItemId++, settlement_id: id, user_code: code,
+        user_name: user?.name ?? 'Onbekend', amount, paid: false, paid_at: null,
       });
-      open.forEach(o => { o.settlement_id = id; });
-      return { data: id, error: null };
-    },
+    });
+    open.forEach(o => { o.settlement_id = id; });
+    markDirty();
+    return { data: id, error: null };
+  };
+
+  return {
+    from: (table: string) => new SandboxQuery(store, table, hooks),
+    rpc,
+    /** Meteen bewaren (bv. na het aanmaken van een verse kopie). */
+    saveNow: async () => { dirty = true; await saveNow(); },
+    /** Nog niet bewaarde wijzigingen alsnog wegschrijven (bij verlaten van de testfase). */
+    flush,
   };
 }
 
@@ -490,6 +578,7 @@ const Index = () => {
       setAdminName('Admin');
       setAdminPermissions(ALL_PERMISSIONS);
       // Op het startscherm altijd weer met de echte database werken.
+      activeClient?.flush?.();
       activeClient = realSupabase;
       setSandboxActive(false);
       setTestGuestSession(false);
@@ -616,19 +705,45 @@ const Index = () => {
     }
   };
 
-  // Kopieert (alleen lezend) de echte data naar het geheugen en laat de app
-  // daarna met die kopie werken. Wat je ook doet: de echte data blijft staan.
-  const enterSandbox = async () => {
+  // Hoe de testkopie wordt bewaard: in één aparte kolom van de instellingenrij
+  // (app_settings.test_data). De echte tabellen worden hier nooit voor aangeraakt.
+  const sandboxPersistence: SandboxPersistence = {
+    load: async () => {
+      const { data } = await realSupabase
+        .from('app_settings_2025_10_08_21_03')
+        .select('test_data')
+        .eq('id', 1)
+        .single();
+      const saved = data?.test_data;
+      return saved && typeof saved === 'object' && saved[SBT.users] ? (saved as SBStore) : null;
+    },
+    save: async (store) => {
+      await realSupabase
+        .from('app_settings_2025_10_08_21_03')
+        .update({ test_data: store })
+        .eq('id', 1);
+    },
+  };
+
+  // Start de testkopie. Bestaat er al testdata (eerdere testbestellingen),
+  // dan wordt die hervat; met `fresh` begin je opnieuw met een verse kopie
+  // van de echte voorraad/gebruikers (alleen gelezen) en een lege geschiedenis.
+  const enterSandbox = async (fresh = false) => {
     setLoading(true);
     try {
-      const store = await loadSandboxStore(realSupabase);
-      activeClient = createSandboxClient(store);
+      let store: SBStore | null = null;
+      if (!fresh) {
+        try { store = await sandboxPersistence.load(); } catch (e) { store = null; }
+      }
+      const isNew = !store;
+      if (!store) store = await loadSandboxStore(realSupabase);
+
+      const client = createSandboxClient(store, sandboxPersistence);
+      activeClient = client;
+      if (isNew) await client.saveNow();
       setSandboxActive(true);
+
       // Echte data van het scherm halen zodat die niet met testdata mengt.
-      // De testgebruiker bestaat alleen in de kopie.
-      await supabase
-        .from('users_2025_10_08_21_03')
-        .insert({ name: 'Testgebruiker', code: TEST_USER_CODE, status: 'approved' });
       const { data: sandboxUsers } = await supabase.from('users_2025_10_08_21_03').select('*');
       setUsers(sandboxUsers || []);
       setProducts([]);
@@ -645,6 +760,7 @@ const Index = () => {
   };
 
   const exitSandbox = () => {
+    activeClient?.flush?.(); // laatste testwijzigingen nog bewaren
     activeClient = realSupabase;
     setSandboxActive(false);
     setUsers([]);
@@ -678,10 +794,16 @@ const Index = () => {
       if (error) throw error;
       setTestMode(newValue);
       if (newValue) {
-        await enterSandbox();
+        await enterSandbox(true);
         toast({ title: "Testfase aan", description: "Je werkt nu met een kopie. Niets wordt opgeslagen.", duration: 6000 });
       } else {
+        await activeClient?.flush?.(); // eerst eventuele lopende opslag afronden
         exitSandbox();
+        // Testdata opruimen: bij de volgende testfase begin je weer schoon.
+        await realSupabase
+          .from('app_settings_2025_10_08_21_03')
+          .update({ test_data: null })
+          .eq('id', 1);
         await loadSettings();
         toast({ title: "Testfase uit", description: "Beheer werkt weer met de echte data. Bestellen kan weer.", duration: 6000 });
       }
@@ -698,7 +820,8 @@ const Index = () => {
 
   // Begin opnieuw met een verse kopie van de echte data.
   const resetSandbox = async () => {
-    await enterSandbox();
+    if (!confirm("Testdata resetten?\n\nAlle testbestellingen en testwijzigingen worden gewist en je begint weer met een verse kopie.")) return;
+    await enterSandbox(true);
     toast({ title: "Testdata gereset", description: "Je werkt weer met een verse kopie van de echte data." });
   };
 
@@ -716,10 +839,26 @@ const Index = () => {
       toast({ title: "Fout", description: "Kon de testgebruiker niet aanmaken", variant: "destructive" });
       return;
     }
+
+    // Ook de testgebruiker kan door een onbetaalde (test)tikkie geblokkeerd zijn.
+    const tikkie = await getTikkieStatus(TEST_USER_CODE);
+    if (tikkie.overdueAmount > 0) {
+      exitSandbox();
+      setTikkieBlock({ amount: tikkie.overdueAmount });
+      return;
+    }
+    if (tikkie.pendingAmount > 0 && tikkie.nextDue) {
+      toast({
+        title: "Tikkie openstaand",
+        description: `Betaal €${tikkie.pendingAmount.toFixed(2)} vóór ${tikkie.nextDue.toLocaleString('nl-NL', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}`,
+        duration: 8000
+      });
+    }
+
     setTestGuestSession(true);
     setCurrentUser(testUser);
     await loadOrderScreen();
-    toast({ title: "Testgebruiker", description: "Je bestelt op een kopie. Niets wordt echt opgeslagen." });
+    toast({ title: "Testgebruiker", description: "Je bestelt op de testkopie. Je testbestellingen blijven bewaard tot je de testfase uitzet." });
   };
 
   // Een testbestelling plaatsen als een bestaande gebruiker (op de kopie).
@@ -1176,7 +1315,7 @@ const Index = () => {
       // startscherm zien (onderhoud, testfase).
       const { data } = await realSupabase
         .from('app_settings_2025_10_08_21_03')
-        .select('*')
+        .select('maintenance_mode, maintenance_message, lock_code_enabled, test_mode')
         .eq('id', 1)
         .single();
       if (data) {
@@ -2307,7 +2446,7 @@ const Index = () => {
                   <div>
                     <p className="font-semibold">Testfase: je werkt met een kopie van de data</p>
                     <p className="text-sm text-muted-foreground">
-                      Alles wat je hier doet (ook bestellen, tikkies, voorraad en gebruikers) wordt <strong>niet</strong> opgeslagen in de echte database. De echte geschiedenis (bestellingen, omzet, verdwenen goederen, tikkies) wordt hier niet getoond: je ziet alleen je eigen testbestellingen. Gasten kunnen nu niet bestellen.
+                      Alles wat je hier doet (ook bestellen, tikkies, voorraad en gebruikers) wordt <strong>niet</strong> opgeslagen in de echte database. De echte geschiedenis (bestellingen, omzet, verdwenen goederen, tikkies) wordt hier niet getoond: je ziet alleen je testbestellingen, en die blijven bewaard tot je de testfase uitzet. Gasten kunnen nu niet bestellen.
                     </p>
                   </div>
                 </div>
