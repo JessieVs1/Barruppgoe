@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { supabase } from '@/integrations/supabase/client';
+import { supabase as realSupabase } from '@/integrations/supabase/client';
+import { createSandboxClient, loadSandboxStore } from '@/lib/sandboxClient';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -10,6 +11,17 @@ import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
 import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Download, Lock, Clock, KeyRound, Wallet } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
+
+// ---------- Testfase ----------
+// Alle database-aanroepen in deze pagina lopen via `supabase`. Normaal is
+// dat de echte database; tijdens de testfase wijst `activeClient` naar een
+// kopie in het geheugen (zie src/lib/sandboxClient.ts), zodat er niets in
+// de echte data wordt aangepast.
+let activeClient: any = realSupabase;
+const supabase = {
+  from: (table: string) => activeClient.from(table),
+  rpc: (fn: string, args?: Record<string, unknown>) => activeClient.rpc(fn, args),
+} as unknown as typeof realSupabase;
 
 // ---------- Wekelijkse slotcode (verandert elke donderdag) ----------
 // De code is volledig voorspelbaar uit de datum (geen database nodig):
@@ -166,6 +178,9 @@ const Index = () => {
   const [isMainAdmin, setIsMainAdmin] = useState(false);
   const [adminName, setAdminName] = useState('Admin');
   const [adminPermissions, setAdminPermissions] = useState<string[]>(ALL_PERMISSIONS);
+  const [testMode, setTestMode] = useState(false);
+  const [sandboxActive, setSandboxActive] = useState(false);
+  const [testUserCode, setTestUserCode] = useState('');
   const [showThankYou, setShowThankYou] = useState(false);
   const [thankYouShowsCode, setThankYouShowsCode] = useState(true);
   const [adminCodes, setAdminCodes] = useState<AdminCode[]>([]);
@@ -210,6 +225,9 @@ const Index = () => {
       setIsMainAdmin(false);
       setAdminName('Admin');
       setAdminPermissions(ALL_PERMISSIONS);
+      // Op het startscherm altijd weer met de echte database werken.
+      activeClient = realSupabase;
+      setSandboxActive(false);
     }
   }, [currentScreen]);
 
@@ -258,6 +276,16 @@ const Index = () => {
     if (code) {
       setLoading(true);
       try {
+        // Tijdens de testfase kan er niet besteld worden (vers gecontroleerd).
+        if (await fetchRealTestMode()) {
+          setTestMode(true);
+          toast({
+            title: "Testfase actief",
+            description: "Bestellen kan op dit moment niet. Probeer het later nog eens.",
+            variant: "destructive"
+          });
+          return;
+        }
         const { data } = await supabase
           .from('users_2025_10_08_21_03')
           .select('*')
@@ -303,6 +331,119 @@ const Index = () => {
         setLoading(false);
       }
     }
+  };
+
+  // Leest (altijd uit de echte database) of de testfase aan staat.
+  const fetchRealTestMode = async (): Promise<boolean> => {
+    try {
+      const { data } = await realSupabase
+        .from('app_settings_2025_10_08_21_03')
+        .select('test_mode')
+        .eq('id', 1)
+        .single();
+      return data?.test_mode === true;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  // Kopieert (alleen lezend) de echte data naar het geheugen en laat de app
+  // daarna met die kopie werken. Wat je ook doet: de echte data blijft staan.
+  const enterSandbox = async () => {
+    setLoading(true);
+    try {
+      const store = await loadSandboxStore(realSupabase);
+      activeClient = createSandboxClient(store);
+      setSandboxActive(true);
+      // Echte data van het scherm halen zodat die niet met testdata mengt.
+      const { data: sandboxUsers } = await supabase.from('users_2025_10_08_21_03').select('*');
+      setUsers(sandboxUsers || []);
+      setProducts([]);
+      setOrders([]);
+      setMissingItems([]);
+      setMonthlyRevenue([]);
+      setSettlements([]);
+      setSettlementItems([]);
+      setAdminCodes([]);
+      setAdminSection('');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const exitSandbox = () => {
+    activeClient = realSupabase;
+    setSandboxActive(false);
+    setUsers([]);
+    setProducts([]);
+    setOrders([]);
+    setMissingItems([]);
+    setMonthlyRevenue([]);
+    setSettlements([]);
+    setSettlementItems([]);
+    setAdminCodes([]);
+    setAdminSection('');
+  };
+
+  // Zet de testfase aan of uit (alleen met recht op "instellingen").
+  // Dit is de enige echte schrijfactie van de testfase: de vlag zelf, zodat
+  // het startscherm op alle apparaten de melding kan tonen.
+  const toggleTestMode = async () => {
+    const newValue = !testMode;
+    if (newValue) {
+      if (!confirm("Testfase aanzetten?\n\nGasten kunnen dan tijdelijk niet bestellen en zien een melding op het startscherm. Alles wat je in Beheer doet gebeurt op een kopie van de data en wordt NIET opgeslagen.")) return;
+    } else if (sandboxActive) {
+      if (!confirm("Testfase uitzetten?\n\nAlle testdata verdwijnt en Beheer werkt weer met de echte data.")) return;
+    }
+
+    setLoading(true);
+    try {
+      const { error } = await realSupabase
+        .from('app_settings_2025_10_08_21_03')
+        .update({ test_mode: newValue, updated_at: new Date().toISOString() })
+        .eq('id', 1);
+      if (error) throw error;
+      setTestMode(newValue);
+      if (newValue) {
+        await enterSandbox();
+        toast({ title: "Testfase aan", description: "Je werkt nu met een kopie. Niets wordt opgeslagen.", duration: 6000 });
+      } else {
+        exitSandbox();
+        await loadSettings();
+        toast({ title: "Testfase uit", description: "Beheer werkt weer met de echte data. Bestellen kan weer.", duration: 6000 });
+      }
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon de testfase niet wijzigen (is het SQL-script al gedraaid?)",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Begin opnieuw met een verse kopie van de echte data.
+  const resetSandbox = async () => {
+    await enterSandbox();
+    toast({ title: "Testdata gereset", description: "Je werkt weer met een verse kopie van de echte data." });
+  };
+
+  // Een testbestelling plaatsen als een bestaande gebruiker (op de kopie).
+  const startTestOrder = async () => {
+    const approved = users.filter(u => u.status !== 'pending');
+    const user = approved.find(u => u.code === testUserCode) || approved[0];
+    if (!user) {
+      toast({ title: "Fout", description: "Er is geen gebruiker om mee te testen", variant: "destructive" });
+      return;
+    }
+    const tikkie = await getTikkieStatus(user.code);
+    if (tikkie.overdueAmount > 0) {
+      setTikkieBlock({ amount: tikkie.overdueAmount });
+      return;
+    }
+    setCurrentUser(user);
+    await loadOrderScreen();
   };
 
   // Kijkt of iemand openstaande (onbetaalde) tikkies heeft, en of de
@@ -360,34 +501,42 @@ const Index = () => {
     }
   };
 
+  // Opent het beheerscherm. Staat de testfase aan, dan werkt elke beheerder
+  // automatisch met de testkopie in plaats van de echte data.
+  const openAdmin = async (name: string, main: boolean, permissions: string[]) => {
+    const realTest = await fetchRealTestMode();
+    setTestMode(realTest);
+    if (realTest) {
+      await enterSandbox();
+    } else {
+      activeClient = realSupabase;
+      setSandboxActive(false);
+    }
+    setIsMainAdmin(main);
+    setAdminName(name);
+    setAdminPermissions(permissions);
+    setMissingItemForm(prev => ({ ...prev, reported_by: name }));
+    setCurrentScreen('admin');
+    setAdminSection('');
+    refreshSettlements();
+  };
+
   const promptAdminCode = async () => {
     const code = prompt("Voer de beheercode in:");
     if (code === null) return; // geannuleerd
 
-    if (code === MAIN_ADMIN_CODE) {
-      setIsMainAdmin(true);
-      setAdminName('Admin');
-      setAdminPermissions(ALL_PERMISSIONS);
-      setMissingItemForm(prev => ({ ...prev, reported_by: 'Admin' }));
-      setCurrentScreen('admin');
-      setAdminSection('');
-      refreshSettlements();
-      return;
-    }
-
     setLoading(true);
     try {
+      if (code === MAIN_ADMIN_CODE) {
+        await openAdmin('Admin', true, ALL_PERMISSIONS);
+        return;
+      }
+
       const { data } = code
         ? await supabase.from('admin_codes_2025_10_08_21_03').select('*').eq('code', code).maybeSingle()
         : { data: null };
       if (data) {
-        setIsMainAdmin(false);
-        setAdminName(data.name);
-        setAdminPermissions(Array.isArray(data.permissions) ? data.permissions : ALL_PERMISSIONS);
-        setMissingItemForm(prev => ({ ...prev, reported_by: data.name }));
-        setCurrentScreen('admin');
-        setAdminSection('');
-        refreshSettlements();
+        await openAdmin(data.name, false, Array.isArray(data.permissions) ? data.permissions : ALL_PERMISSIONS);
         toast({ title: `Welkom ${data.name}`, description: "Ingelogd als beheerder" });
       } else {
         toast({
@@ -498,13 +647,28 @@ const Index = () => {
 
     setLoading(true);
     try {
+      // Testfase aangezet terwijl iemand al aan het bestellen was? Dan niet doorgaan.
+      if (!sandboxActive && (await fetchRealTestMode())) {
+        setShowConfirmOrder(false);
+        setCart([]);
+        setTestMode(true);
+        setCurrentScreen('start');
+        setCurrentUser(null);
+        toast({
+          title: "Testfase actief",
+          description: "Bestellen kan op dit moment niet. Je bestelling is niet geplaatst.",
+          variant: "destructive"
+        });
+        return;
+      }
+
       // Is de betaaltermijn van een tikkie intussen verlopen? Dan niet meer bestellen.
       const tikkie = await getTikkieStatus(currentUser.code);
       if (tikkie.overdueAmount > 0) {
         setShowConfirmOrder(false);
         setCart([]);
         setTikkieBlock({ amount: tikkie.overdueAmount });
-        setCurrentScreen('start');
+        setCurrentScreen(sandboxActive ? 'admin' : 'start');
         setCurrentUser(null);
         return;
       }
@@ -576,7 +740,7 @@ const Index = () => {
     if (thankYouShowsCode) {
       setShowLockCodeDialog(true);
     } else {
-      setCurrentScreen('start');
+      setCurrentScreen(sandboxActive ? 'admin' : 'start');
       setCurrentUser(null);
     }
   };
@@ -590,7 +754,7 @@ const Index = () => {
 
   const closeLockCodeDialog = () => {
     setShowLockCodeDialog(false);
-    setCurrentScreen('start');
+    setCurrentScreen(sandboxActive ? 'admin' : 'start');
     setCurrentUser(null);
   };
 
@@ -715,7 +879,9 @@ const Index = () => {
   // gewijzigd.
   const loadSettings = async () => {
     try {
-      const { data } = await supabase
+      // Bewust altijd de echte database: dit bepaalt wat gasten op het
+      // startscherm zien (onderhoud, testfase).
+      const { data } = await realSupabase
         .from('app_settings_2025_10_08_21_03')
         .select('*')
         .eq('id', 1)
@@ -724,6 +890,7 @@ const Index = () => {
         setMaintenanceMode(!!data.maintenance_mode);
         if (data.maintenance_message) setMaintenanceMessage(data.maintenance_message);
         setLockCodeEnabled(data.lock_code_enabled !== false);
+        setTestMode(data.test_mode === true);
       }
     } catch (error) {
       // Instellingen-tabel bestaat nog niet of is niet bereikbaar:
@@ -1420,10 +1587,41 @@ const Index = () => {
     toast({ title: "Bon gedownload", description: fileName });
   };
 
+  const tikkieDialog = (
+        <Dialog open={tikkieBlock !== null} onOpenChange={(open) => { if (!open) setTikkieBlock(null); }}>
+          <DialogContent className="bar-card">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2 text-destructive">
+                <Wallet className="h-5 w-5" />
+                Eerst je tikkie betalen
+              </DialogTitle>
+              <DialogDescription>
+                Je hebt een openstaande tikkie van €{tikkieBlock?.amount.toFixed(2)} die niet op tijd is betaald.
+                Bestellen kan pas weer nadat je die hebt betaald. Zet je drinken voor nu terug.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button onClick={() => setTikkieBlock(null)} className="w-full glow-effect">
+                Begrepen
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+  );
+
   if (currentScreen === 'start') {
     return (
       <div className="min-h-screen bg-gradient-to-br from-background via-muted to-background flex items-center justify-center p-4 animate-fade-in">
         <div className="w-full max-w-md space-y-4">
+          {testMode && (
+            <div className="bg-destructive/10 border border-destructive/40 text-foreground rounded-xl p-4 flex items-start gap-3 animate-slide-up">
+              <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">Testfase actief</p>
+                <p className="text-sm text-muted-foreground">De app wordt op dit moment getest. Bestellen kan nu niet; probeer het later nog eens.</p>
+              </div>
+            </div>
+          )}
           {maintenanceMode && (
             <div className="bg-primary/15 border border-primary/40 text-foreground rounded-xl p-4 flex items-start gap-3 animate-slide-up">
               <AlertTriangle className="h-5 w-5 text-primary flex-shrink-0 mt-0.5" />
@@ -1443,10 +1641,10 @@ const Index = () => {
                 onClick={promptUserCode}
                 className="w-full bar-button glow-effect"
                 size="lg"
-                disabled={loading}
+                disabled={loading || testMode}
               >
                 <ShoppingCart className="mr-2 h-5 w-5" />
-                {loading ? "Laden..." : "Bestellen"}
+                {loading ? "Laden..." : testMode ? "Bestellen (niet mogelijk)" : "Bestellen"}
               </Button>
               <Button
                 onClick={() => setShowRegisterDialog(true)}
@@ -1504,26 +1702,7 @@ const Index = () => {
           </DialogContent>
         </Dialog>
 
-        {/* Geblokkeerd door onbetaalde tikkie */}
-        <Dialog open={tikkieBlock !== null} onOpenChange={(open) => { if (!open) setTikkieBlock(null); }}>
-          <DialogContent className="bar-card">
-            <DialogHeader>
-              <DialogTitle className="flex items-center gap-2 text-destructive">
-                <Wallet className="h-5 w-5" />
-                Eerst je tikkie betalen
-              </DialogTitle>
-              <DialogDescription>
-                Je hebt een openstaande tikkie van €{tikkieBlock?.amount.toFixed(2)} die niet op tijd is betaald.
-                Bestellen kan pas weer nadat je die hebt betaald. Zet je drinken voor nu terug.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogFooter>
-              <Button onClick={() => setTikkieBlock(null)} className="w-full glow-effect">
-                Begrepen
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+        {tikkieDialog}
       </div>
     );
   }
@@ -1534,6 +1713,12 @@ const Index = () => {
     return (
       <div className="min-h-screen bg-gradient-to-br from-background via-muted to-background p-4 animate-fade-in">
         <div className="max-w-4xl mx-auto space-y-6">
+          {sandboxActive && (
+            <div className="bg-destructive/10 border border-destructive/40 rounded-xl p-3 text-sm flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-destructive flex-shrink-0" />
+              Testbestelling: dit gebeurt op een kopie, niets wordt echt opgeslagen.
+            </div>
+          )}
           {/* Header with user name */}
           <div className="flex justify-between items-center animate-slide-up">
             <h1 className="text-3xl font-bold gradient-text">🛒 Bestellen</h1>
@@ -1695,12 +1880,12 @@ const Index = () => {
               {loading ? "Verwerken..." : "Bevestig bestelling"}
             </Button>
             <Button 
-              onClick={() => { setCurrentScreen('start'); setCurrentUser(null); setCart([]); }} 
+              onClick={() => { setCurrentScreen(sandboxActive ? 'admin' : 'start'); setCurrentUser(null); setCart([]); }} 
               variant="outline" 
               className="w-full bar-button"
               disabled={loading}
             >
-              Terug naar start
+              {sandboxActive ? 'Terug naar beheer' : 'Terug naar start'}
             </Button>
           </div>
         </div>
@@ -1821,6 +2006,43 @@ const Index = () => {
             </Button>
           </div>
 
+          {sandboxActive && (
+            <Card className="bar-card border-destructive/40 animate-slide-up">
+              <CardContent className="p-4 space-y-3">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-semibold">Testfase: je werkt met een kopie van de data</p>
+                    <p className="text-sm text-muted-foreground">
+                      Alles wat je hier doet (ook bestellen, tikkies, voorraad en gebruikers) wordt <strong>niet</strong> opgeslagen in de echte database. Gasten kunnen nu niet bestellen.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2 sm:items-end">
+                  <div className="flex-1">
+                    <label className="text-xs font-medium text-muted-foreground">Bestelflow testen als</label>
+                    <select
+                      className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                      value={testUserCode || users.filter(u => u.status !== 'pending')[0]?.code || ''}
+                      onChange={(e) => setTestUserCode(e.target.value)}
+                    >
+                      {users.filter(u => u.status !== 'pending').map(u => (
+                        <option key={u.id} value={u.code}>{u.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <Button onClick={startTestOrder} disabled={loading} className="bar-button glow-effect">
+                    <ShoppingCart className="mr-2 h-4 w-4" />
+                    Bestelflow testen
+                  </Button>
+                  <Button onClick={resetSandbox} disabled={loading} variant="outline" className="bar-button">
+                    Testdata resetten
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
           {/* Slotcode + Onderhoudsmodus */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 animate-slide-up">
             <Card className="bar-card">
@@ -1835,6 +2057,25 @@ const Index = () => {
                   </p>
                 </div>
                 <Badge variant="outline" className="text-xs whitespace-nowrap">Wisselt elke donderdag</Badge>
+              </CardContent>
+            </Card>
+
+            <Card className="bar-card">
+              <CardContent className="p-4 flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-sm font-medium flex items-center gap-2">
+                    <AlertTriangle className="h-4 w-4" />
+                    Testfase
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {testMode ? "Aan — gasten kunnen niet bestellen, jij werkt op een kopie" : "Uit — alles werkt met de echte data"}
+                  </p>
+                </div>
+                <Switch
+                  checked={testMode}
+                  onCheckedChange={toggleTestMode}
+                  disabled={loading || !can('settings')}
+                />
               </CardContent>
             </Card>
 
@@ -2049,6 +2290,8 @@ const Index = () => {
             />
           )}
         </div>
+
+        {tikkieDialog}
 
         {/* Missing Item Dialog */}
         <Dialog open={showMissingItemDialog} onOpenChange={setShowMissingItemDialog}>
