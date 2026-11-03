@@ -538,6 +538,7 @@ const Index = () => {
   const [adminCodes, setAdminCodes] = useState<AdminCode[]>([]);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
   const [settlementItems, setSettlementItems] = useState<SettlementItem[]>([]);
+  const [tikkieReminder, setTikkieReminder] = useState<{ amount: number; due: Date } | null>(null);
   const [tikkieBlock, setTikkieBlock] = useState<{ amount: number } | null>(null);
   const [showMissingItemDialog, setShowMissingItemDialog] = useState(false);
   const [showRegisterDialog, setShowRegisterDialog] = useState(false);
@@ -663,13 +664,7 @@ const Index = () => {
             setTikkieBlock({ amount: tikkie.overdueAmount });
             return;
           }
-          if (tikkie.pendingAmount > 0 && tikkie.nextDue) {
-            toast({
-              title: "Tikkie openstaand",
-              description: `Betaal €${tikkie.pendingAmount.toFixed(2)} vóór ${tikkie.nextDue.toLocaleString('nl-NL', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}`,
-              duration: 8000
-            });
-          }
+          setTikkieReminder(tikkie.pendingAmount > 0 && tikkie.nextDue ? { amount: tikkie.pendingAmount, due: tikkie.nextDue } : null);
           setCurrentUser(data);
           loadOrderScreen();
         } else {
@@ -847,13 +842,7 @@ const Index = () => {
       setTikkieBlock({ amount: tikkie.overdueAmount });
       return;
     }
-    if (tikkie.pendingAmount > 0 && tikkie.nextDue) {
-      toast({
-        title: "Tikkie openstaand",
-        description: `Betaal €${tikkie.pendingAmount.toFixed(2)} vóór ${tikkie.nextDue.toLocaleString('nl-NL', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}`,
-        duration: 8000
-      });
-    }
+    setTikkieReminder(tikkie.pendingAmount > 0 && tikkie.nextDue ? { amount: tikkie.pendingAmount, due: tikkie.nextDue } : null);
 
     setTestGuestSession(true);
     setCurrentUser(testUser);
@@ -874,6 +863,7 @@ const Index = () => {
       setTikkieBlock({ amount: tikkie.overdueAmount });
       return;
     }
+    setTikkieReminder(tikkie.pendingAmount > 0 && tikkie.nextDue ? { amount: tikkie.pendingAmount, due: tikkie.nextDue } : null);
     setCurrentUser(user);
     await loadOrderScreen();
   };
@@ -2145,6 +2135,17 @@ const Index = () => {
     return (
       <div className="min-h-screen bg-gradient-to-br from-background via-muted to-background p-4 animate-fade-in">
         <div className="max-w-4xl mx-auto space-y-6">
+          {tikkieReminder && (
+            <div className="bg-primary/15 border border-primary/40 rounded-xl p-4 flex items-start gap-3 animate-slide-up">
+              <Wallet className="h-5 w-5 text-primary flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">Je hebt een openstaande tikkie</p>
+                <p className="text-sm text-muted-foreground">
+                  Betaal €{tikkieReminder.amount.toFixed(2)} vóór {tikkieReminder.due.toLocaleString('nl-NL', { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}. Daarna kun je pas weer bestellen als de tikkie is betaald.
+                </p>
+              </div>
+            </div>
+          )}
           {sandboxActive && (
             <div className="bg-destructive/10 border border-destructive/40 rounded-xl p-3 text-sm flex items-center gap-2">
               <AlertTriangle className="h-4 w-4 text-destructive flex-shrink-0" />
