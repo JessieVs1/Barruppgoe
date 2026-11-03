@@ -537,7 +537,7 @@ interface MonthlyRevenue {
   updated_at: string;
 }
 
-const Index = () => {
+const IndexMain = () => {
   const [currentScreen, setCurrentScreen] = useState<'start' | 'order' | 'admin'>('start');
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
@@ -4065,6 +4065,40 @@ const AdminCodeManagement = ({ adminCodes, onAdd, onUpdatePermissions, onDelete,
         </div>
       </CardContent>
     </Card>
+  );
+};
+
+// Welkomstanimatie bij het openen van de app, daarna het hoofdscherm.
+const WelcomeSplash = ({ onDone }: { onDone: () => void }) => {
+  const [leaving, setLeaving] = useState(false);
+
+  useEffect(() => {
+    const t1 = setTimeout(() => setLeaving(true), 2300);
+    const t2 = setTimeout(onDone, 2900);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [onDone]);
+
+  return (
+    <div
+      className={`welcome-splash fixed inset-0 z-[100] flex flex-col items-center justify-center bg-background px-6 text-center ${leaving ? 'welcome-splash-out' : ''}`}
+      onClick={() => { setLeaving(true); setTimeout(onDone, 400); }}
+      role="status"
+      aria-label="Welkom bij de Barapp"
+    >
+      <div className="welcome-mug text-7xl mb-6" aria-hidden="true">🍻</div>
+      <p className="welcome-line1 text-xl text-muted-foreground">Welkom bij de</p>
+      <h1 className="welcome-line2 text-4xl font-bold mt-1">Barapp</h1>
+    </div>
+  );
+};
+
+const Index = () => {
+  const [showSplash, setShowSplash] = useState(true);
+  return (
+    <>
+      {showSplash && <WelcomeSplash onDone={() => setShowSplash(false)} />}
+      <IndexMain />
+    </>
   );
 };
 
