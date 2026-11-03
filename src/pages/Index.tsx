@@ -66,6 +66,11 @@ async function loadSandboxStore(real: any): Promise<SBStore> {
   SB_ALL_TABLES.forEach((table, i) => {
     store[table] = sbClone(results[i]);
   });
+  // Geschiedenis van de echte data niet meenemen: in de testfase begint alles
+  // leeg, zodat je alleen de bestellingen van je eigen test ziet.
+  [SBT.orders, SBT.missing, SBT.revenue, SBT.settlements, SBT.settlementItems].forEach(table => {
+    store[table] = [];
+  });
   return store;
 }
 
@@ -620,6 +625,10 @@ const Index = () => {
       activeClient = createSandboxClient(store);
       setSandboxActive(true);
       // Echte data van het scherm halen zodat die niet met testdata mengt.
+      // De testgebruiker bestaat alleen in de kopie.
+      await supabase
+        .from('users_2025_10_08_21_03')
+        .insert({ name: 'Testgebruiker', code: TEST_USER_CODE, status: 'approved' });
       const { data: sandboxUsers } = await supabase.from('users_2025_10_08_21_03').select('*');
       setUsers(sandboxUsers || []);
       setProducts([]);
@@ -698,9 +707,6 @@ const Index = () => {
   // ongemoeid.
   const startGuestTest = async () => {
     await enterSandbox();
-    await supabase
-      .from('users_2025_10_08_21_03')
-      .insert({ name: 'Testgebruiker', code: TEST_USER_CODE, status: 'approved' });
     const { data: testUser } = await supabase
       .from('users_2025_10_08_21_03')
       .select('*')
@@ -719,7 +725,7 @@ const Index = () => {
   // Een testbestelling plaatsen als een bestaande gebruiker (op de kopie).
   const startTestOrder = async () => {
     const approved = users.filter(u => u.status !== 'pending');
-    const user = approved.find(u => u.code === testUserCode) || approved[0];
+    const user = approved.find(u => u.code === (testUserCode || TEST_USER_CODE)) || approved[0];
     if (!user) {
       toast({ title: "Fout", description: "Er is geen gebruiker om mee te testen", variant: "destructive" });
       return;
@@ -2301,7 +2307,7 @@ const Index = () => {
                   <div>
                     <p className="font-semibold">Testfase: je werkt met een kopie van de data</p>
                     <p className="text-sm text-muted-foreground">
-                      Alles wat je hier doet (ook bestellen, tikkies, voorraad en gebruikers) wordt <strong>niet</strong> opgeslagen in de echte database. Gasten kunnen nu niet bestellen.
+                      Alles wat je hier doet (ook bestellen, tikkies, voorraad en gebruikers) wordt <strong>niet</strong> opgeslagen in de echte database. De echte geschiedenis (bestellingen, omzet, verdwenen goederen, tikkies) wordt hier niet getoond: je ziet alleen je eigen testbestellingen. Gasten kunnen nu niet bestellen.
                     </p>
                   </div>
                 </div>
@@ -2310,10 +2316,10 @@ const Index = () => {
                     <label className="text-xs font-medium text-muted-foreground">Bestelflow testen als</label>
                     <select
                       className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                      value={testUserCode || users.filter(u => u.status !== 'pending')[0]?.code || ''}
+                      value={testUserCode || TEST_USER_CODE}
                       onChange={(e) => setTestUserCode(e.target.value)}
                     >
-                      {users.filter(u => u.status !== 'pending').map(u => (
+                      {[...users.filter(u => u.status !== 'pending')].sort((a, b) => (a.code === TEST_USER_CODE ? -1 : b.code === TEST_USER_CODE ? 1 : 0)).map(u => (
                         <option key={u.id} value={u.code}>{u.name}</option>
                       ))}
                     </select>
