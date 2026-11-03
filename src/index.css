@@ -188,3 +188,40 @@
     transform: scale(1);
   }
 }
+
+/* Bedankt-animatie na een bestelling */
+.thank-you-check {
+  stroke-dasharray: 40;
+  stroke-dashoffset: 40;
+  animation: drawCheck 0.6s ease-out 0.35s forwards;
+}
+
+.animate-wave {
+  animation: wave 1.2s ease-in-out 0.6s 2;
+}
+
+@keyframes drawCheck {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes wave {
+  0%, 100% { transform: rotate(0deg); }
+  20% { transform: rotate(18deg); }
+  40% { transform: rotate(-12deg); }
+  60% { transform: rotate(18deg); }
+  80% { transform: rotate(-8deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thank-you-check {
+    animation: none;
+    stroke-dashoffset: 0;
+  }
+  .animate-wave,
+  .animate-bounce-in,
+  .animate-slide-up {
+    animation: none;
+  }
+}
