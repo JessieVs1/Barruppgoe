@@ -8,7 +8,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
-import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Download, Lock, Clock, KeyRound, Wallet } from 'lucide-react';
+import { Plus, Minus, ShoppingCart, User, Package, BarChart3, AlertTriangle, ArrowUp, Search, Filter, Menu, X, Receipt, Download, Lock, Clock, KeyRound, Wallet, ScrollText } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 
 // ---------- Nep-database voor de testfase (in het geheugen) ----------
@@ -35,6 +35,7 @@ const SBT = {
   adminCodes: 'admin_codes_2025_10_08_21_03',
   settlements: 'settlements_2025_10_08_21_03',
   settlementItems: 'settlement_items_2025_10_08_21_03',
+  logs: 'activity_log_2025_10_08_21_03',
 };
 
 const SB_ALL_TABLES = Object.values(SBT);
@@ -46,7 +47,7 @@ const SB_UNIQUE: Record<string, string[]> = {
   [SBT.revenue]: ['year', 'month'],
 };
 
-const SB_ALL_PERMISSIONS = ['users', 'products', 'orders', 'revenue', 'missing', 'settlements', 'settings'];
+const SB_ALL_PERMISSIONS = ['users', 'products', 'orders', 'revenue', 'missing', 'settlements', 'settings', 'logs'];
 
 function sbClone<X>(v: X): X {
   return JSON.parse(JSON.stringify(v));
@@ -70,7 +71,7 @@ async function loadSandboxStore(real: any): Promise<SBStore> {
   });
   // Geschiedenis van de echte data niet meenemen: in de testfase begint alles
   // leeg, zodat je alleen de bestellingen van je eigen test ziet.
-  [SBT.orders, SBT.missing, SBT.revenue, SBT.settlements, SBT.settlementItems].forEach(table => {
+  [SBT.orders, SBT.missing, SBT.revenue, SBT.settlements, SBT.settlementItems, SBT.logs].forEach(table => {
     store[table] = [];
   });
   // De vorige testkopie zelf hoort niet in de nieuwe kopie terecht te komen.
@@ -137,6 +138,7 @@ class SandboxQuery implements PromiseLike<any> {
   private filters: Array<(r: SBRow) => boolean> = [];
   private sorts: Array<{ col: string; asc: boolean }> = [];
   private mode: 'many' | 'single' | 'maybe' = 'many';
+  private maxRows: number | null = null;
 
   constructor(
     private store: SBStore,
@@ -158,6 +160,7 @@ class SandboxQuery implements PromiseLike<any> {
   is(col: string, val: any) { this.filters.push(r => (val === null ? r[col] === null || r[col] === undefined : r[col] === val)); return this; }
   in(col: string, vals: any[]) { this.filters.push(r => vals.includes(r[col])); return this; }
   order(col: string, opts?: { ascending?: boolean }) { this.sorts.push({ col, asc: opts?.ascending !== false }); return this; }
+  limit(n: number) { this.maxRows = n; return this; }
   single() { this.mode = 'single'; return this; }
   maybeSingle() { this.mode = 'maybe'; return this; }
 
@@ -209,6 +212,7 @@ class SandboxQuery implements PromiseLike<any> {
           return (av < bv ? -1 : 1) * (s.asc ? 1 : -1);
         });
       }
+      if (this.maxRows !== null) found = found.slice(0, this.maxRows);
       return this.shape(found);
     }
 
@@ -468,8 +472,32 @@ const ADMIN_PERMISSIONS = [
   { key: 'missing', label: 'Verdwenen goederen' },
   { key: 'settlements', label: 'Tikkies' },
   { key: 'settings', label: 'Onderhoudsmodus & slotcode-schakelaar' },
+  { key: 'logs', label: 'Logs bekijken' },
 ] as const;
 const ALL_PERMISSIONS: string[] = ADMIN_PERMISSIONS.map(p => p.key);
+
+interface LogEntry {
+  id: number;
+  created_at: string;
+  category: string;
+  action: string;
+  actor: string;
+  details: string | null;
+}
+
+// Categorieën in de logs (sleutel -> label in het scherm).
+const LOG_CATEGORIES: Record<string, string> = {
+  bestelling: 'Bestellingen',
+  inloggen: 'Inloggen',
+  gebruikers: 'Gebruikers',
+  voorraad: 'Voorraad',
+  verdwenen: 'Verdwenen goederen',
+  tikkies: 'Tikkies',
+  instellingen: 'Instellingen',
+  beheerders: 'Beheerders',
+  testfase: 'Testfase',
+  bon: 'Bonnen',
+};
 
 interface Settlement {
   id: number;
@@ -538,6 +566,7 @@ const Index = () => {
   const [adminCodes, setAdminCodes] = useState<AdminCode[]>([]);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
   const [settlementItems, setSettlementItems] = useState<SettlementItem[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [tikkieReminder, setTikkieReminder] = useState<{ amount: number; due: Date } | null>(null);
   const [tikkieBlock, setTikkieBlock] = useState<{ amount: number } | null>(null);
   const [showMissingItemDialog, setShowMissingItemDialog] = useState(false);
@@ -626,6 +655,43 @@ const Index = () => {
   // Mag de ingelogde beheerder dit onderdeel van Beheer gebruiken?
   const can = (permission: string) => isMainAdmin || adminPermissions.includes(permission);
 
+  // ---------- Logs ----------
+  // Wie doet de handeling? Beheerder in Beheer, anders de ingelogde besteller.
+  const currentActor = () =>
+    currentScreen === 'admin'
+      ? (isMainAdmin ? 'Hoofdbeheerder' : adminName)
+      : (currentUser?.name ?? 'Gast');
+
+  // Schrijft een regel in het activiteitenlog. Mislukt dat (bv. tabel nog niet
+  // aangemaakt), dan gaat de app gewoon door. Tijdens de testfase komt dit in
+  // het testlog terecht, niet in het echte log.
+  const logEvent = (category: string, action: string, details = '', actor: string = currentActor()) => {
+    Promise.resolve(
+      supabase.from('activity_log_2025_10_08_21_03').insert({ category, action, actor, details })
+    ).catch(() => {});
+  };
+
+  const loadLogs = async () => {
+    setLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('activity_log_2025_10_08_21_03')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(1000);
+      if (error) throw error;
+      setLogs(data || []);
+    } catch (error) {
+      toast({
+        title: "Fout",
+        description: "Kon logs niet laden (is het SQL-script al gedraaid?)",
+        variant: "destructive"
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const promptUserCode = async () => {
     const code = prompt("Voer je gebruikerscode in:");
     if (code) {
@@ -638,6 +704,7 @@ const Index = () => {
             await startGuestTest();
             return;
           }
+          logEvent('inloggen', 'Inlogpoging geweigerd tijdens testfase', '', 'Gast');
           toast({
             title: "Testfase actief",
             description: "Bestellen kan op dit moment niet. Probeer het later nog eens.",
@@ -652,6 +719,7 @@ const Index = () => {
           .single();
         
         if (data && data.status === 'pending') {
+          logEvent('inloggen', 'Inlogpoging geweigerd: registratie nog niet goedgekeurd', '', data.name);
           toast({
             title: "Nog niet goedgekeurd",
             description: "Je registratie wacht nog op goedkeuring door de beheerder",
@@ -661,13 +729,16 @@ const Index = () => {
           // Openstaande tikkie niet op tijd betaald? Dan geen toegang tot bestellen.
           const tikkie = await getTikkieStatus(data.code);
           if (tikkie.overdueAmount > 0) {
+            logEvent('inloggen', 'Bestellen geblokkeerd: tikkie niet op tijd betaald', `Openstaand €${tikkie.overdueAmount.toFixed(2)}`, data.name);
             setTikkieBlock({ amount: tikkie.overdueAmount });
             return;
           }
           setTikkieReminder(tikkie.pendingAmount > 0 && tikkie.nextDue ? { amount: tikkie.pendingAmount, due: tikkie.nextDue } : null);
+          logEvent('inloggen', 'Ingelogd om te bestellen', '', data.name);
           setCurrentUser(data);
           loadOrderScreen();
         } else {
+          logEvent('inloggen', 'Inlogpoging met ongeldige gebruikerscode', '', 'Onbekend');
           toast({
             title: "Fout",
             description: "Ongeldige gebruikerscode",
@@ -788,6 +859,7 @@ const Index = () => {
         .eq('id', 1);
       if (error) throw error;
       setTestMode(newValue);
+      logEvent('testfase', newValue ? 'Testfase aangezet' : 'Testfase uitgezet');
       if (newValue) {
         await enterSandbox(true);
         toast({ title: "Testfase aan", description: "Je werkt nu met een kopie. Niets wordt opgeslagen.", duration: 6000 });
@@ -951,6 +1023,7 @@ const Index = () => {
     try {
       if (code === MAIN_ADMIN_CODE) {
         await openAdmin('Admin', true, ALL_PERMISSIONS);
+        logEvent('inloggen', 'Ingelogd in Beheer', 'Hoofdbeheerder', 'Hoofdbeheerder');
         return;
       }
 
@@ -959,8 +1032,10 @@ const Index = () => {
         : { data: null };
       if (data) {
         await openAdmin(data.name, false, Array.isArray(data.permissions) ? data.permissions : ALL_PERMISSIONS);
+        logEvent('inloggen', 'Ingelogd in Beheer', 'Beheerder', data.name);
         toast({ title: `Welkom ${data.name}`, description: "Ingelogd als beheerder" });
       } else {
+        logEvent('inloggen', 'Inlogpoging in Beheer met ongeldige beheercode', '', 'Onbekend');
         toast({
           title: "Fout",
           description: "Ongeldige beheercode",
@@ -1058,6 +1133,7 @@ const Index = () => {
     for (const item of cart) {
       const product = products.find(p => p.id === item.id);
       if (!product || product.stock < item.quantity) {
+        logEvent('bestelling', 'Bestelling niet geplaatst: onvoldoende voorraad', `${item.quantity}x ${item.name}`, currentUser.name);
         toast({
           title: "Fout",
           description: `Onvoldoende voorraad voor ${item.name}`,
@@ -1071,6 +1147,7 @@ const Index = () => {
     try {
       // Testfase aangezet terwijl iemand al aan het bestellen was? Dan niet doorgaan.
       if (!sandboxActive && (await fetchRealTestMode())) {
+        logEvent('bestelling', 'Bestelling niet geplaatst: testfase actief', '', currentUser.name);
         setShowConfirmOrder(false);
         setCart([]);
         setTestMode(true);
@@ -1087,6 +1164,7 @@ const Index = () => {
       // Is de betaaltermijn van een tikkie intussen verlopen? Dan niet meer bestellen.
       const tikkie = await getTikkieStatus(currentUser.code);
       if (tikkie.overdueAmount > 0) {
+        logEvent('bestelling', 'Bestelling niet geplaatst: tikkie niet op tijd betaald', `Openstaand €${tikkie.overdueAmount.toFixed(2)}`, currentUser.name);
         setShowConfirmOrder(false);
         setCart([]);
         setTikkieBlock({ amount: tikkie.overdueAmount });
@@ -1120,6 +1198,13 @@ const Index = () => {
       const failed = results.find(r => r.error);
       if (failed?.error) throw failed.error;
 
+      logEvent(
+        'bestelling',
+        'Bestelling geplaatst',
+        `${cart.map(i => `${i.quantity}x ${i.name}`).join(', ')} — totaal €${cart.reduce((sum, i) => sum + i.price * i.quantity, 0).toFixed(2)}`,
+        currentUser.name
+      );
+
       toast({
         title: "Succes! 🎉",
         description: "Bestelling succesvol geplaatst!",
@@ -1146,6 +1231,7 @@ const Index = () => {
       setThankYouShowsCode(showCode);
       setShowThankYou(true);
     } catch (error) {
+      logEvent('bestelling', 'Bestelling mislukt door een fout', '', currentUser?.name ?? 'Gast');
       toast({
         title: "Fout",
         description: "Er ging iets mis bij het plaatsen van de bestelling",
@@ -1335,6 +1421,7 @@ const Index = () => {
     setLoading(true);
     try {
       await updateSetting({ maintenance_mode: newValue });
+      logEvent('instellingen', newValue ? 'Onderhoudsmodus aangezet' : 'Onderhoudsmodus uitgezet');
       setMaintenanceMode(newValue);
       toast({
         title: "Succes",
@@ -1356,6 +1443,7 @@ const Index = () => {
     setLoading(true);
     try {
       await updateSetting({ lock_code_enabled: newValue });
+      logEvent('instellingen', newValue ? 'Slotcode-popup aangezet' : 'Slotcode-popup uitgezet');
       setLockCodeEnabled(newValue);
       toast({
         title: "Succes",
@@ -1419,6 +1507,7 @@ const Index = () => {
         }
         throw error;
       }
+      logEvent('beheerders', 'Beheercode aangemaakt', `${cleanName} — rechten: ${permissions.join(', ') || 'geen'}`);
       await loadAdminCodes();
       toast({ title: "Succes", description: `Beheercode voor ${cleanName} aangemaakt` });
     } catch (error) {
@@ -1435,6 +1524,7 @@ const Index = () => {
         .update({ permissions })
         .eq('id', id);
       if (error) throw error;
+      logEvent('beheerders', 'Rechten van beheerder aangepast', `${adminCodes.find(a => a.id === id)?.name ?? ''} — rechten: ${permissions.join(', ') || 'geen'}`);
       setAdminCodes(prev => prev.map(a => (a.id === id ? { ...a, permissions } : a)));
     } catch (error) {
       toast({ title: "Fout", description: "Kon rechten niet opslaan (is het SQL-script al gedraaid?)", variant: "destructive" });
@@ -1448,6 +1538,7 @@ const Index = () => {
     try {
       const { error } = await supabase.from('admin_codes_2025_10_08_21_03').delete().eq('id', id);
       if (error) throw error;
+      logEvent('beheerders', 'Beheercode verwijderd', adminCodes.find(a => a.id === id)?.name ?? '');
       await loadAdminCodes();
       toast({ title: "Succes", description: "Beheercode verwijderd" });
     } catch (error) {
@@ -1498,6 +1589,7 @@ const Index = () => {
     try {
       const { error } = await supabase.rpc('create_settlement', { p_due_at: dueAt.toISOString() });
       if (error) throw error;
+      logEvent('tikkies', 'Stand vastgezet voor tikkies', `Betalen vóór ${dueAt.toLocaleString('nl-NL')}`);
       await loadSettlementData();
       toast({ title: "Vastgezet", description: "De afrekening staat klaar. De bestelgeschiedenis begint opnieuw.", duration: 6000 });
     } catch (error: any) {
@@ -1521,6 +1613,8 @@ const Index = () => {
         .update({ paid, paid_at: paid ? new Date().toISOString() : null })
         .eq('id', itemId);
       if (error) throw error;
+      const paidItem = settlementItems.find(i => i.id === itemId);
+      logEvent('tikkies', paid ? 'Tikkie als betaald gemarkeerd' : 'Tikkie als niet betaald gemarkeerd', paidItem ? `${paidItem.user_name} — €${Number(paidItem.amount).toFixed(2)}` : '');
       await loadSettlementData();
     } catch (error) {
       toast({ title: "Fout", description: "Kon betaalstatus niet wijzigen", variant: "destructive" });
@@ -1541,6 +1635,7 @@ const Index = () => {
         .update({ due_at: dueAt.toISOString() })
         .eq('id', settlementId);
       if (error) throw error;
+      logEvent('tikkies', 'Betaaltermijn van tikkie aangepast', `Nieuw: ${dueAt.toLocaleString('nl-NL')}`);
       await loadSettlementData();
       toast({ title: "Succes", description: "Betaaltermijn aangepast" });
     } catch (error) {
@@ -1585,6 +1680,7 @@ const Index = () => {
         return;
       }
 
+      logEvent('gebruikers', 'Registratie aangevraagd', name, name);
       setRegisterForm({ name: '', code: '' });
       setShowRegisterDialog(false);
       toast({
@@ -1607,6 +1703,7 @@ const Index = () => {
     setLoading(true);
     try {
       await supabase.from('users_2025_10_08_21_03').update({ status: 'approved' }).eq('id', id);
+      logEvent('gebruikers', 'Registratie goedgekeurd', users.find(u => u.id === id)?.name ?? '');
       await loadUsers();
       toast({ title: "Succes", description: "Gebruiker goedgekeurd" });
     } catch (error) {
@@ -1625,7 +1722,9 @@ const Index = () => {
 
     setLoading(true);
     try {
+      const rejectedName = users.find(u => u.id === id)?.name ?? '';
       await supabase.from('users_2025_10_08_21_03').delete().eq('id', id);
+      logEvent('gebruikers', 'Registratie afgewezen', rejectedName);
       await loadUsers();
       toast({ title: "Succes", description: "Registratie afgewezen" });
     } catch (error) {
@@ -1652,6 +1751,7 @@ const Index = () => {
     setLoading(true);
     try {
       await supabase.from('users_2025_10_08_21_03').insert({ name, code, status: 'approved' });
+      logEvent('gebruikers', 'Gebruiker toegevoegd', name);
       await loadUsers();
       toast({ title: "Succes", description: "Gebruiker toegevoegd" });
     } catch (error) {
@@ -1670,7 +1770,9 @@ const Index = () => {
 
     setLoading(true);
     try {
+      const deletedName = users.find(u => u.id === id)?.name ?? '';
       await supabase.from('users_2025_10_08_21_03').delete().eq('id', id);
+      logEvent('gebruikers', 'Gebruiker verwijderd', deletedName);
       await loadUsers();
       toast({ title: "Succes", description: "Gebruiker verwijderd" });
     } catch (error) {
@@ -1697,6 +1799,7 @@ const Index = () => {
     setLoading(true);
     try {
       await supabase.from('products_2025_10_08_21_03').insert({ name, price, stock, description });
+      logEvent('voorraad', 'Product toegevoegd', `${name} — €${Number(price).toFixed(2)}, voorraad ${stock}`);
       const { data } = await supabase.from('products_2025_10_08_21_03').select('*');
       setProducts(data || []);
       toast({ title: "Succes", description: "Product toegevoegd" });
@@ -1716,7 +1819,9 @@ const Index = () => {
 
     setLoading(true);
     try {
+      const deletedProduct = products.find(p => p.id === id);
       await supabase.from('products_2025_10_08_21_03').delete().eq('id', id);
+      logEvent('voorraad', 'Product verwijderd', deletedProduct?.name ?? '');
       const { data } = await supabase.from('products_2025_10_08_21_03').select('*');
       setProducts(data || []);
       toast({ title: "Succes", description: "Product verwijderd" });
@@ -1735,6 +1840,8 @@ const Index = () => {
     setLoading(true);
     try {
       await supabase.from('products_2025_10_08_21_03').update(updates).eq('id', id);
+      const before = products.find(p => p.id === id);
+      logEvent('voorraad', 'Product aangepast', `${before?.name ?? ''}${updates.name && before && updates.name !== before.name ? ` → ${updates.name}` : ''}${updates.price !== undefined && before && updates.price !== before.price ? ` — prijs €${Number(before.price).toFixed(2)} → €${Number(updates.price).toFixed(2)}` : ''}`);
       const { data } = await supabase.from('products_2025_10_08_21_03').select('*');
       setProducts(data || []);
       toast({ title: "Succes", description: "Product bijgewerkt" });
@@ -1765,6 +1872,9 @@ const Index = () => {
       const diff = product ? product.stock - stock : 0;
 
       await supabase.from('products_2025_10_08_21_03').update({ stock }).eq('id', id);
+      if (product) {
+        logEvent('voorraad', 'Voorraad handmatig aangepast', `${product.name}: ${product.stock} → ${stock}${diff > 0 ? ` (verschil van ${diff} geregistreerd als verdwenen)` : ''}`);
+      }
 
       // If the stock was manually lowered, log the difference automatically
       // so it shows up under "Verdwenen goederen" instead of silently disappearing.
@@ -1814,6 +1924,7 @@ const Index = () => {
     setLoading(true);
     try {
       await supabase.from('missing_items_2025_10_08_21_03').insert(missingItemForm);
+      logEvent('verdwenen', 'Verdwenen goederen gerapporteerd', `${missingItemForm.quantity}x ${missingItemForm.product_name} — ${missingItemForm.reason}`);
       
       // Update product stock if product exists
       const product = products.find(p => p.name === missingItemForm.product_name);
@@ -1852,6 +1963,7 @@ const Index = () => {
         .delete()
         .is('settlement_id', null);
       if (clearError) throw clearError;
+      logEvent('bestelling', 'Alle lopende bestellingen verwijderd');
       await loadOrders();
       toast({
         title: "Succes", 
@@ -2636,6 +2748,16 @@ const Index = () => {
               )}
             </Button>
             )}
+            {can('logs') && (
+              <Button
+                onClick={() => { setAdminSection('logs'); loadLogs(); setShowMobileMenu(false); }}
+                variant={adminSection === 'logs' ? 'default' : 'outline'}
+                className="h-20 bar-button"
+              >
+                <ScrollText className="mr-2 h-5 w-5" />
+                Logs
+              </Button>
+            )}
             {isMainAdmin && (
               <Button
                 onClick={() => { setAdminSection('admincodes'); loadAdminCodes(); setShowMobileMenu(false); }}
@@ -2698,6 +2820,10 @@ const Index = () => {
               onReportMissing={() => setShowMissingItemDialog(true)}
               loading={loading}
             />
+          )}
+
+          {adminSection === 'logs' && can('logs') && (
+            <LogSection logs={logs} loading={loading} onRefresh={loadLogs} />
           )}
 
           {adminSection === 'settlements' && can('settlements') && (
@@ -3586,6 +3712,86 @@ const formatRemaining = (due: Date, now: Date) => {
 };
 
 // Component for Tikkie settlements
+const LogSection = ({ logs, loading, onRefresh }: {
+  logs: LogEntry[];
+  loading: boolean;
+  onRefresh: () => void;
+}) => {
+  const [category, setCategory] = useState('alle');
+  const [search, setSearch] = useState('');
+
+  const q = search.trim().toLowerCase();
+  const visible = logs.filter(l =>
+    (category === 'alle' || l.category === category) &&
+    (!q || `${l.action} ${l.actor} ${l.details ?? ''}`.toLowerCase().includes(q))
+  );
+
+  const formatTime = (iso: string) =>
+    new Date(iso).toLocaleString('nl-NL', {
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="flex items-center gap-2">
+            <ScrollText className="h-5 w-5" />
+            Logs
+          </CardTitle>
+          <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
+            Vernieuwen
+          </Button>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Hier staat alles wat er in de app gebeurt: bestellingen, inloggen, beheeracties, voorraad en meer. Nieuwste bovenaan (laatste 1000 regels).
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex flex-col sm:flex-row gap-2">
+          <Input
+            placeholder="Zoek op naam, actie of details..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <select
+            className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+            value={category}
+            onChange={(e) => setCategory(e.target.value)}
+          >
+            <option value="alle">Alle categorieën</option>
+            {Object.entries(LOG_CATEGORIES).map(([key, label]) => (
+              <option key={key} value={key}>{label}</option>
+            ))}
+          </select>
+        </div>
+
+        {visible.length === 0 ? (
+          <p className="text-center text-muted-foreground py-8">
+            {loading ? 'Laden...' : 'Geen logregels gevonden.'}
+          </p>
+        ) : (
+          <div className="space-y-2">
+            {visible.map(l => (
+              <div key={l.id} className="rounded-md border p-3 text-sm">
+                <div className="flex flex-wrap items-center gap-2 mb-1">
+                  <Badge variant="secondary">{LOG_CATEGORIES[l.category] ?? l.category}</Badge>
+                  <span className="font-medium">{l.action}</span>
+                </div>
+                {l.details && <p className="text-muted-foreground">{l.details}</p>}
+                <p className="text-xs text-muted-foreground mt-1">
+                  {formatTime(l.created_at)} · {l.actor}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+};
+
 const SettlementSection = ({ currentOrders, users, settlements, items, onCreate, onSetPaid, onUpdateDue, loading }: {
   currentOrders: Order[];
   users: User[];
