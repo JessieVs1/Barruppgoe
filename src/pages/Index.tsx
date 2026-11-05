@@ -571,6 +571,14 @@ const IndexMain = () => {
   const [tikkieBlock, setTikkieBlock] = useState<{ amount: number } | null>(null);
   const [showMissingItemDialog, setShowMissingItemDialog] = useState(false);
   const [showRegisterDialog, setShowRegisterDialog] = useState(false);
+  const [showBonDialog, setShowBonDialog] = useState(false);
+  const [bonCode, setBonCode] = useState('');
+  const [bonResult, setBonResult] = useState<{
+    name: string;
+    orders: Order[];
+    total: number;
+    open: { amount: number; due: Date; overdue: boolean }[];
+  } | null>(null);
   const [registerForm, setRegisterForm] = useState({ name: '', code: '' });
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -687,6 +695,83 @@ const IndexMain = () => {
         description: "Kon logs niet laden (is het SQL-script al gedraaid?)",
         variant: "destructive"
       });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Bon bekijken vanaf het hoofdscherm: alleen lezen, zonder in te loggen.
+  const closeBonDialog = () => {
+    setShowBonDialog(false);
+    setBonCode('');
+    setBonResult(null);
+  };
+
+  const lookupBon = async () => {
+    const code = bonCode.trim();
+    if (!code) return;
+    setLoading(true);
+    try {
+      const { data: user } = await supabase
+        .from('users_2025_10_08_21_03')
+        .select('*')
+        .eq('code', code)
+        .maybeSingle();
+
+      if (!user || user.status === 'pending') {
+        setBonResult(null);
+        toast({
+          title: user ? "Nog niet goedgekeurd" : "Code niet gevonden",
+          description: user
+            ? "Je registratie wacht nog op goedkeuring door de beheerder"
+            : "Controleer je code en probeer het opnieuw",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      const { data: orderRows, error } = await supabase
+        .from('orders_2025_10_08_21_03')
+        .select('*')
+        .eq('user_code', user.code)
+        .is('settlement_id', null)
+        .order('created_at', { ascending: false });
+      if (error) throw error;
+      const orders: Order[] = orderRows || [];
+
+      // Eerder vastgezette tikkies die nog niet betaald zijn
+      const open: { amount: number; due: Date; overdue: boolean }[] = [];
+      try {
+        const { data: items } = await supabase
+          .from('settlement_items_2025_10_08_21_03')
+          .select('*')
+          .eq('user_code', user.code)
+          .eq('paid', false);
+        if (items && items.length > 0) {
+          const { data: sets } = await supabase
+            .from('settlements_2025_10_08_21_03')
+            .select('*')
+            .in('id', [...new Set(items.map(i => i.settlement_id))]);
+          for (const item of items) {
+            const st = (sets || []).find(x => x.id === item.settlement_id);
+            if (!st) continue;
+            const due = new Date(st.due_at);
+            open.push({ amount: Number(item.amount), due, overdue: due <= new Date() });
+          }
+        }
+      } catch (e) {
+        // geen tikkie-gegevens beschikbaar: alleen de bestellingen tonen
+      }
+
+      logEvent('bon', 'Bon bekeken', '', user.name);
+      setBonResult({
+        name: user.name,
+        orders,
+        total: orders.reduce((sum, o) => sum + Number(o.price) * o.quantity, 0),
+        open,
+      });
+    } catch (error) {
+      toast({ title: "Fout", description: "Kon je bon niet ophalen", variant: "destructive" });
     } finally {
       setLoading(false);
     }
@@ -2191,6 +2276,16 @@ const IndexMain = () => {
                 Nieuw account aanvragen
               </Button>
               <Button
+                onClick={() => setShowBonDialog(true)}
+                variant="secondary"
+                className="w-full bar-button"
+                size="lg"
+                disabled={loading}
+              >
+                <Receipt className="mr-2 h-5 w-5" />
+                Bon
+              </Button>
+              <Button
                 onClick={promptAdminCode}
                 variant="outline"
                 className="w-full bar-button"
@@ -2232,6 +2327,95 @@ const IndexMain = () => {
               <Button onClick={registerUser} disabled={loading || !registerForm.name || !registerForm.code} className="glow-effect">
                 {loading ? "Versturen..." : "Aanvragen"}
               </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Bon Dialog */}
+        <Dialog open={showBonDialog} onOpenChange={(open) => { if (!open) closeBonDialog(); }}>
+          <DialogContent className="bar-card max-h-[90vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Receipt className="h-5 w-5" />
+                Jouw bon
+              </DialogTitle>
+              <DialogDescription>
+                Vul je code in om te zien wat je hebt besteld en hoe hoog je tikkie nu is.
+              </DialogDescription>
+            </DialogHeader>
+
+            {!bonResult ? (
+              <div className="space-y-3">
+                <Input
+                  type="password"
+                  placeholder="Je code"
+                  value={bonCode}
+                  onChange={(e) => setBonCode(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') lookupBon(); }}
+                  autoFocus
+                />
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <p className="font-semibold">{bonResult.name}</p>
+
+                {bonResult.open.map((t, i) => (
+                  <div
+                    key={i}
+                    className={`rounded-lg border p-3 text-sm ${t.overdue ? 'border-destructive/50 bg-destructive/10' : 'border-primary/40 bg-primary/10'}`}
+                  >
+                    <p className="font-semibold">
+                      Vastgezette tikkie: €{t.amount.toFixed(2)}
+                    </p>
+                    <p className="text-muted-foreground">
+                      {t.overdue
+                        ? 'De betaaltermijn is verlopen. Betaal eerst je tikkie om weer te kunnen bestellen.'
+                        : `Betalen vóór ${t.due.toLocaleString('nl-NL', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })}`}
+                    </p>
+                  </div>
+                ))}
+
+                {bonResult.orders.length === 0 ? (
+                  <p className="text-center text-muted-foreground py-4">Je hebt nog niets besteld sinds de laatste tikkie.</p>
+                ) : (
+                  <div className="space-y-2">
+                    <p className="text-sm text-muted-foreground">Besteld sinds de laatste tikkie</p>
+                    {bonResult.orders.map(o => (
+                      <div key={o.id} className="flex items-center justify-between gap-2 text-sm border-b pb-2">
+                        <div>
+                          <p>{o.quantity}x {o.name}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {new Date(o.created_at).toLocaleString('nl-NL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                          </p>
+                        </div>
+                        <span className="font-medium">€{(Number(o.price) * o.quantity).toFixed(2)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between rounded-lg bg-muted p-3 font-semibold">
+                  <span>Je tikkie is nu</span>
+                  <span>€{bonResult.total.toFixed(2)}</span>
+                </div>
+              </div>
+            )}
+
+            <DialogFooter>
+              {!bonResult ? (
+                <>
+                  <Button variant="outline" onClick={closeBonDialog} disabled={loading}>
+                    Annuleren
+                  </Button>
+                  <Button onClick={lookupBon} disabled={loading || !bonCode.trim()} className="glow-effect">
+                    {loading ? "Laden..." : "Bon bekijken"}
+                  </Button>
+                </>
+              ) : (
+                <Button onClick={closeBonDialog} className="w-full glow-effect">
+                  Sluiten
+                </Button>
+              )}
             </DialogFooter>
           </DialogContent>
         </Dialog>
